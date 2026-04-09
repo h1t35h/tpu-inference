@@ -844,17 +844,26 @@ class DeepseekV2Moe(JaxModule):
                  quant_config,
                  scoring_func,
                  rng,
+                 hf_config,
                  prefix: str = ""):
 
+        _hidden_size = getattr(hf_config, "hidden_size", hidden_size)
+        _num_local_experts = getattr(hf_config, "n_routed_experts", num_local_experts)
+        _num_experts_per_token = getattr(hf_config, "num_experts_per_tok", num_experts_per_token)
+        _n_group = getattr(hf_config, "n_group", n_group)
+        _routed_scaling_factor = getattr(hf_config, "routed_scaling_factor", routed_scaling_factor)
+        _num_shared_experts = getattr(hf_config, "n_shared_experts", num_shared_experts)
+        _moe_intermediate_size = getattr(hf_config, "moe_intermediate_size", moe_intermediate_size)
+
         self.gate = DeepSeekV3Router(
-            hidden_size=hidden_size,
-            num_experts=num_local_experts,
-            num_experts_per_tok=num_experts_per_token,
-            n_groups=n_group,
-            topk_groups=4,
+            hidden_size=_hidden_size,
+            num_experts=_num_local_experts,
+            num_experts_per_tok=_num_experts_per_token,
+            n_groups=_n_group,
+            topk_groups=getattr(hf_config, "topk_groups", 4),
             norm_topk_prob=True,
             rngs=rng,
-            routed_scaling_factor=routed_scaling_factor,
+            routed_scaling_factor=_routed_scaling_factor,
             dtype=dtype,
             moe_backend=moe_backend,
             activation_ffw_td=P(ShardingAxisName.MLP_DATA, None),
@@ -867,8 +876,8 @@ class DeepseekV2Moe(JaxModule):
         self.shared_experts = DeepseekV3MLP(
             dtype=dtype,
             hidden_act=hidden_act,
-            hidden_size=hidden_size,
-            intermediate_size=num_shared_experts * moe_intermediate_size,
+            hidden_size=_hidden_size,
+            intermediate_size=_num_shared_experts * _moe_intermediate_size,
             rngs=rng,
             activation_ffw_td=P(ShardingAxisName.MLP_DATA, None),
             df_sharding=P(None, ShardingAxisName.ATTN_HEAD),
@@ -894,13 +903,13 @@ class DeepseekV2Moe(JaxModule):
 
         self.experts = SharedFusedMoe(
             dtype=dtype,
-            num_local_experts=num_local_experts,
+            num_local_experts=_num_local_experts,
             apply_expert_weight_before_computation=False,
             expert_axis_name=expert_axis_name,
             num_expert_parallelism=num_expert_parallelism,
-            hidden_size=hidden_size,
-            intermediate_size_moe=moe_intermediate_size,
-            num_experts_per_tok=num_experts_per_token,
+            hidden_size=_hidden_size,
+            intermediate_size_moe=_moe_intermediate_size,
+            num_experts_per_tok=_num_experts_per_token,
             mesh=mesh,
             hidden_act=hidden_act,
             rngs=rng,
@@ -918,7 +927,7 @@ class DeepseekV2Moe(JaxModule):
             router=self.gate,
             shared_experts=self.shared_experts,
             scoring_func=scoring_func,
-            routed_scaling_factor=routed_scaling_factor)
+            routed_scaling_factor=_routed_scaling_factor)
 
     def __call__(self, x_TD: jax.Array):
         return self.experts(x_TD)
@@ -1142,9 +1151,26 @@ class DeepSeekV3(JaxModule):
         dtype = vllm_config.model_config.dtype
         scoring_func = getattr(hf_config, "scoring_func", "sigmoid")
 
+        # Read configs from HF config with fallbacks to module-level defaults
+        _num_attention_heads = getattr(hf_config, "num_attention_heads", num_attention_heads)
+        _num_key_value_heads = getattr(hf_config, "num_key_value_heads", num_key_value_heads)
+        _ffw_intermediate_size = getattr(hf_config, "intermediate_size", ffw_intermediate_size)
+        _interleave_moe_layer_step = getattr(hf_config, "moe_layer_freq", interleave_moe_layer_step)
+        _hidden_act = getattr(hf_config, "hidden_act", hidden_act)
+        _rms_norm_eps = getattr(hf_config, "rms_norm_eps", rms_norm_eps)
+        _first_k_dense_replace = getattr(hf_config, "first_k_dense_replace", first_k_dense_replace)
+        _rope_theta = getattr(hf_config, "rope_theta", rope_theta)
+        _rope_scaling = getattr(hf_config, "rope_scaling", rope_scaling)
+        _q_lora_rank = getattr(hf_config, "q_lora_rank", q_lora_rank)
+        _kv_lora_rank = getattr(hf_config, "kv_lora_rank", kv_lora_rank)
+        _qk_nope_head_dim = getattr(hf_config, "qk_nope_head_dim", qk_nope_head_dim)
+        _qk_rope_head_dim = getattr(hf_config, "qk_rope_head_dim", qk_rope_head_dim)
+        _v_head_dim = getattr(hf_config, "v_head_dim", v_head_dim)
+        _hidden_size = getattr(hf_config, "hidden_size", hidden_size)
+
         if self.is_first_rank:
             self.embed_tokens = JaxEmbed(
-                num_embeddings=vocab_size,
+                num_embeddings=vllm_config.model_config.get_vocab_size(),
                 features=hf_config.hidden_size,
                 param_dtype=dtype,
                 dtype=dtype,
@@ -1158,16 +1184,16 @@ class DeepSeekV3(JaxModule):
             self.embed_tokens = PPMissingLayer()
 
         self.rope_emb = DeepseekScalingRotaryEmbedding(
-            rotary_dim=qk_rope_head_dim,
-            rope_theta=rope_theta,
-            original_max_position_embeddings=rope_scaling[
+            rotary_dim=_qk_rope_head_dim,
+            rope_theta=_rope_theta,
+            original_max_position_embeddings=_rope_scaling[
                 "original_max_position_embeddings"],
-            scaling_factor=rope_scaling["factor"],
+            scaling_factor=_rope_scaling["factor"],
             dtype=dtype,
-            beta_fast=rope_scaling["beta_fast"],
-            beta_slow=rope_scaling["beta_slow"],
-            mscale_value=rope_scaling["mscale"],
-            mscale_all_dim=rope_scaling["mscale_all_dim"],
+            beta_fast=_rope_scaling["beta_fast"],
+            beta_slow=_rope_scaling["beta_slow"],
+            mscale_value=_rope_scaling["mscale"],
+            mscale_all_dim=_rope_scaling["mscale_all_dim"],
         )
 
         def _create_deepseek_attention(
@@ -1191,23 +1217,23 @@ class DeepSeekV3(JaxModule):
                 attn_cls = DeepseekV3MLA
             else:
                 attn_cls = DeepseekV3Attention
-                assert num_attention_heads == num_key_value_heads, "Expected same number of of attention heads and key value heads for MHA."
+                assert _num_attention_heads == _num_key_value_heads, "Expected same number of of attention heads and key value heads for MHA."
 
             kwargs = dict(
-                q_lora_rank=q_lora_rank,
-                kv_lora_rank=kv_lora_rank,
-                qk_nope_head_dim=qk_nope_head_dim,
-                qk_rope_head_dim=qk_rope_head_dim,
-                rms_norm_eps=rms_norm_eps,
-                v_head_dim=v_head_dim,
+                q_lora_rank=_q_lora_rank,
+                kv_lora_rank=_kv_lora_rank,
+                qk_nope_head_dim=_qk_nope_head_dim,
+                qk_rope_head_dim=_qk_rope_head_dim,
+                rms_norm_eps=_rms_norm_eps,
+                v_head_dim=_v_head_dim,
                 mesh=self.mesh,
-                hidden_size=hidden_size,
-                num_attention_heads=num_attention_heads,
+                hidden_size=_hidden_size,
+                num_attention_heads=_num_attention_heads,
                 num_key_value_heads=1
-                if self.use_mla_kernel else num_key_value_heads,
-                head_dim=v_head_dim,  # MLA uses v_head_dim as head_dim
+                if self.use_mla_kernel else _num_key_value_heads,
+                head_dim=_v_head_dim,  # MLA uses v_head_dim as head_dim
                 rope=self.rope_emb,
-                rope_mscale_all_dim=rope_scaling["mscale_all_dim"],
+                rope_mscale_all_dim=_rope_scaling["mscale_all_dim"],
                 dtype=dtype,
                 # TODO (jacobplatin): we should refactor this to pass a dtype (or config) directly
                 kv_cache_dtype=vllm_config.cache_config.cache_dtype,
@@ -1233,8 +1259,8 @@ class DeepSeekV3(JaxModule):
 
         def get_decoder_layer(layer_index: int):
             input_layernorm = JaxRmsNorm(
-                hidden_size,
-                epsilon=rms_norm_eps,
+                _hidden_size,
+                epsilon=_rms_norm_eps,
                 scale_init=nnx.with_partitioning(init_fn, (None, )),
                 dtype=dtype,
                 param_dtype=dtype,
@@ -1243,8 +1269,8 @@ class DeepSeekV3(JaxModule):
             )
 
             post_attention_layernorm = JaxRmsNorm(
-                hidden_size,
-                epsilon=rms_norm_eps,
+                _hidden_size,
+                epsilon=_rms_norm_eps,
                 scale_init=nnx.with_partitioning(init_fn, (None, )),
                 dtype=dtype,
                 param_dtype=dtype,
@@ -1255,19 +1281,19 @@ class DeepSeekV3(JaxModule):
             # Logic to determine if this layer is Dense or MoE
             # * The first k layers are always dense.
             # * Subsequent layers are MoE if interleave_moe_layer_step conditions are met
-            if layer_index < first_k_dense_replace:
+            if layer_index < _first_k_dense_replace:
                 is_moe_layer = False
             else:
                 is_moe_layer = ((layer_index + 1) %
-                                interleave_moe_layer_step == 0)
+                                _interleave_moe_layer_step == 0)
 
             if not is_moe_layer:
                 # Dense Layer (used for first k layers or interleaved dense layers)
                 mlp_layer = DeepseekV3MLP(
                     dtype=dtype,
-                    hidden_act=hidden_act,
-                    hidden_size=hidden_size,
-                    intermediate_size=ffw_intermediate_size,
+                    hidden_act=_hidden_act,
+                    hidden_size=_hidden_size,
+                    intermediate_size=_ffw_intermediate_size,
                     rngs=rng,
                     activation_ffw_td=P(ShardingAxisName.MLP_DATA, None),
                     df_sharding=P(None, ShardingAxisName.ATTN_HEAD),
@@ -1283,6 +1309,7 @@ class DeepSeekV3(JaxModule):
                     quant_config=quant_config,
                     scoring_func=scoring_func,
                     rng=rng,
+                    hf_config=hf_config,
                     prefix=f"{prefix}.layers.{layer_index}.mlp")
 
             return DeepseekV3DecoderLayer(
