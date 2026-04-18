@@ -23,8 +23,9 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from transformers import PretrainedConfig
 from vllm.config import VllmConfig
 from vllm.model_executor.model_loader import get_model_loader
-from vllm.model_executor.model_loader.runai_streamer_loader import \
-    RunaiModelStreamerLoader
+from vllm.model_executor.model_loader.runai_streamer_loader import (
+    RunaiModelStreamerLoader,
+)
 from vllm.utils.func_utils import supports_kw
 
 from tpu_inference import envs
@@ -32,14 +33,17 @@ from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.layers.jax import JaxModule
 from tpu_inference.layers.jax.quantization import get_tpu_quantization_config
 from tpu_inference.logger import init_logger
-from tpu_inference.models.common.interface import (ModelInterface,
-                                                   MultiModalInterface)
+from tpu_inference.models.common.interface import ModelInterface, MultiModalInterface
 from tpu_inference.models.jax.utils.qwix.qwix_utils import (
-    apply_qwix_on_abstract_model, apply_qwix_quantization,
+    apply_qwix_on_abstract_model,
+    apply_qwix_quantization,
     load_random_weights_into_qwix_abstract_model,
-    update_vllm_config_for_qwix_quantization)
-from tpu_inference.models.jax.utils.weight_utils import (BaseWeightLoader,
-                                                         LoadableWithIterator)
+    update_vllm_config_for_qwix_quantization,
+)
+from tpu_inference.models.jax.utils.weight_utils import (
+    BaseWeightLoader,
+    LoadableWithIterator,
+)
 from tpu_inference.utils import to_jax_dtype, to_torch_dtype
 
 logger = init_logger(__name__)
@@ -48,20 +52,22 @@ _MODEL_REGISTRY = {}
 
 # List of architectures that are preferred to use "vllm" implementation over
 # "flax_nnx" implementation due to various factors such as performance.
-_VLLM_PREFERRED_ARCHITECTURES: frozenset[str] = frozenset({
-    "GptOssForCausalLM",
-    "Qwen3MoeForCausalLM",
-    # Gemma4 model is lacking vision support in "flax_nnx" implementation.
-    "Gemma4ForConditionalGeneration",
-})
+_VLLM_PREFERRED_ARCHITECTURES: frozenset[str] = frozenset(
+    {
+        "GptOssForCausalLM",
+        "Qwen3MoeForCausalLM",
+    }
+)
 
 # List of architectures that don't have pipeline parallelism support in jax yet.
 _PP_DISABLED_MODELS: frozenset[str] = frozenset(
-    {"DeepseekV3ForCausalLM", "Eagle3LlamaForCausalLM", "GptOssForCausalLM"})
+    {"DeepseekV3ForCausalLM", "Eagle3LlamaForCausalLM", "GptOssForCausalLM"}
+)
 
 
 class UnsupportedArchitectureError(ValueError):
     """Raised when a model architecture is not supported in the registry."""
+
     pass
 
 
@@ -70,7 +76,7 @@ def _get_model_architecture(config: PretrainedConfig) -> nnx.Module:
     # would cause JAX init failure when using multi hosts with Ray.
 
     from tpu_inference.models.jax.deepseek_v3 import DeepseekV3ForCausalLM
-    from tpu_inference.models.jax.gemma4 import Gemma4ForCausalLM
+    from tpu_inference.models.jax.gemma4_mm import Gemma4ForConditionalGeneration
     from tpu_inference.models.jax.gpt_oss import GptOss
     from tpu_inference.models.jax.kimi_25 import KimiK25ForConditionalGeneration
     from tpu_inference.models.jax.llama3 import LlamaForCausalLM
@@ -78,22 +84,23 @@ def _get_model_architecture(config: PretrainedConfig) -> nnx.Module:
     from tpu_inference.models.jax.llama_eagle3 import EagleLlama3ForCausalLM
     from tpu_inference.models.jax.llama_guard_4 import LlamaGuard4ForCausalLM
     from tpu_inference.models.jax.qwen2 import Qwen2ForCausalLM
-    from tpu_inference.models.jax.qwen2_5_vl import \
-        Qwen2_5_VLForConditionalGeneration
+    from tpu_inference.models.jax.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
     from tpu_inference.models.jax.qwen3 import Qwen3ForCausalLM
     from tpu_inference.models.jax.qwen3_moe import Qwen3MoeForCausalLM
+
     _MODEL_REGISTRY["Llama4ForCausalLM"] = Llama4ForCausalLM
     _MODEL_REGISTRY["DeepseekV3ForCausalLM"] = DeepseekV3ForCausalLM
     _MODEL_REGISTRY["LlamaForCausalLM"] = LlamaForCausalLM
     _MODEL_REGISTRY["Llama4ForConditionalGeneration"] = LlamaGuard4ForCausalLM
     _MODEL_REGISTRY["Qwen3ForCausalLM"] = Qwen3ForCausalLM
     _MODEL_REGISTRY["Qwen3MoeForCausalLM"] = Qwen3MoeForCausalLM
-    _MODEL_REGISTRY[
-        "Qwen2_5_VLForConditionalGeneration"] = Qwen2_5_VLForConditionalGeneration
+    _MODEL_REGISTRY["Qwen2_5_VLForConditionalGeneration"] = (
+        Qwen2_5_VLForConditionalGeneration
+    )
     _MODEL_REGISTRY["Eagle3LlamaForCausalLM"] = EagleLlama3ForCausalLM
     _MODEL_REGISTRY["GptOssForCausalLM"] = GptOss
     _MODEL_REGISTRY["Qwen2ForCausalLM"] = Qwen2ForCausalLM
-    _MODEL_REGISTRY["Gemma4ForConditionalGeneration"] = Gemma4ForCausalLM
+    _MODEL_REGISTRY["Gemma4ForConditionalGeneration"] = Gemma4ForConditionalGeneration
     _MODEL_REGISTRY["KimiK25ForConditionalGeneration"] = KimiK25ForConditionalGeneration
 
     architectures = getattr(config, "architectures", [])
@@ -123,11 +130,10 @@ def _get_nnx_model(
         """
         return model_class(vllm_config, rng, mesh)
 
-    @nnx.jit(donate_argnums=(0, ),
-             static_argnames=('use_qwix_on_abstract_model', ))
+    @nnx.jit(donate_argnums=(0,), static_argnames=("use_qwix_on_abstract_model",))
     def create_jit_model(
-            model: nnx.Module,
-            use_qwix_on_abstract_model: bool = False) -> nnx.Module:
+        model: nnx.Module, use_qwix_on_abstract_model: bool = False
+    ) -> nnx.Module:
         """
         Create a jit model.
 
@@ -142,15 +148,14 @@ def _get_nnx_model(
         nnx.update(model, state)
         if not use_qwix_on_abstract_model:
             # NOTE: if Qwix is not configured, this will be a no-op
-            model = apply_qwix_quantization(vllm_config,
-                                            model,
-                                            rng,
-                                            mesh,
-                                            apply_to_abstract_model=False)
+            model = apply_qwix_quantization(
+                vllm_config, model, rng, mesh, apply_to_abstract_model=False
+            )
         return model
 
     if vllm_config.load_config.load_format == "dummy" and not issubclass(
-            model_class, LoadableWithIterator):
+        model_class, LoadableWithIterator
+    ):
         # Create a sharded model with random inited weights.
         # TODO: currently Qwen2ForCausalLM is using legacy model implementation
         # will merge the random init logic when all model are migrated to new model implementation
@@ -163,20 +168,23 @@ def _get_nnx_model(
                 create_abstract_model,
                 rng,
                 mesh,
-                apply_to_abstract_model=True)
+                apply_to_abstract_model=True,
+            )
 
             model = nnx.eval_shape(abstract_model_fn)
-            quantization_config = vllm_config.model_config.hf_config.quantization_config if hasattr(
-                vllm_config.model_config.hf_config,
-                "quantization_config") else {}
+            quantization_config = (
+                vllm_config.model_config.hf_config.quantization_config
+                if hasattr(vllm_config.model_config.hf_config, "quantization_config")
+                else {}
+            )
             load_random_weights_into_qwix_abstract_model(
-                rng, model, mesh, quantization_config)
+                rng, model, mesh, quantization_config
+            )
             with mesh:
-                jit_model = create_jit_model(model,
-                                             use_qwix_on_abstract_model=True)
+                jit_model = create_jit_model(model, use_qwix_on_abstract_model=True)
             return jit_model
 
-        if getattr(model_class, '_self_manages_sharding', False):
+        if getattr(model_class, "_self_manages_sharding", False):
             # `_self_manages_sharding` is a class-level boolean flag set to True
             # by model classes (e.g. MaxText-backed models) that handle their own
             # JIT-compiled, sharded weight initialization internally — typically by
@@ -188,12 +196,9 @@ def _get_nnx_model(
             with mesh:
                 jit_model = model_class(vllm_config, rng, mesh)
                 jit_model = apply_qwix_quantization(
-                    vllm_config,
-                    jit_model,
-                    rng,
-                    mesh,
-                    apply_to_abstract_model=False)
-                if hasattr(jit_model, 'initialize_cache'):
+                    vllm_config, jit_model, rng, mesh, apply_to_abstract_model=False
+                )
+                if hasattr(jit_model, "initialize_cache"):
                     jit_model.initialize_cache()
             return jit_model
 
@@ -210,12 +215,10 @@ def _get_nnx_model(
         with mesh:
             jit_model = create_sharded_model()
             # In this case, we are applying Qwix quantization to the true, concrete model
-            jit_model = apply_qwix_quantization(vllm_config,
-                                                jit_model,
-                                                rng,
-                                                mesh,
-                                                apply_to_abstract_model=False)
-            if hasattr(jit_model, 'initialize_cache'):
+            jit_model = apply_qwix_quantization(
+                vllm_config, jit_model, rng, mesh, apply_to_abstract_model=False
+            )
+            if hasattr(jit_model, "initialize_cache"):
                 jit_model.initialize_cache()
     else:
         # We first create an abstract model without allocating any weights,
@@ -231,7 +234,8 @@ def _get_nnx_model(
         # NOTE: only one of the abstract (this) or or concrete Qwix quantization paths should
         # be taken
         if should_apply_qwix_on_abstract_model := apply_qwix_on_abstract_model(
-                vllm_config):
+            vllm_config
+        ):
             # NOTE: if Qwix is not configured, this will return `create_abstract_model` and
             # thus be a no-op
             abstract_model_fn = apply_qwix_quantization(
@@ -239,7 +243,8 @@ def _get_nnx_model(
                 create_abstract_model,
                 rng,
                 mesh,
-                apply_to_abstract_model=True)
+                apply_to_abstract_model=True,
+            )
         with jax.set_mesh(mesh):
             model = nnx.eval_shape(abstract_model_fn)
         # Although the created model can already work, we still need to jit
@@ -260,7 +265,8 @@ def _get_nnx_model(
                 if hasattr(vllm_config.model_config, "model_weights"):
                     model_weights = vllm_config.model_config.model_weights
                 weights_iterator = loader._get_weights_iterator(
-                    model_weights, vllm_config.model_config.revision)
+                    model_weights, vllm_config.model_config.revision
+                )
                 # We set the weights iterator at runtime, to prevent having to change
                 # every model's load_weights signature. This also prevents us from hitting
                 # a TypeError at runtime if you use the RunaiModelStreamerLoader with any
@@ -272,8 +278,8 @@ def _get_nnx_model(
             else:
                 model.load_weights(rng)
             jit_model = create_jit_model(
-                model,
-                use_qwix_on_abstract_model=should_apply_qwix_on_abstract_model)
+                model, use_qwix_on_abstract_model=should_apply_qwix_on_abstract_model
+            )
     return jit_model
 
 
@@ -299,20 +305,19 @@ def get_flax_model(
 
     if is_draft_model:
         model_class = _get_model_architecture(
-            vllm_config.speculative_config.draft_model_config.hf_config)
+            vllm_config.speculative_config.draft_model_config.hf_config
+        )
     else:
-        model_class = _get_model_architecture(
-            vllm_config.model_config.hf_config)
+        model_class = _get_model_architecture(vllm_config.model_config.hf_config)
     jit_model = _get_nnx_model(model_class, vllm_config, rng, mesh)
     vllm_config.model_config.dtype = original_dtype
     kv_cache_sharding = NamedSharding(
         mesh,
-        PartitionSpec(ShardingAxisName.ATTN_DATA, None,
-                      ShardingAxisName.ATTN_HEAD))
-    hidden_states_sharding = NamedSharding(mesh,
-                                           PartitionSpec(
-                                               ShardingAxisName.ATTN_DATA,
-                                               None))  # (T, D)
+        PartitionSpec(ShardingAxisName.ATTN_DATA, None, ShardingAxisName.ATTN_HEAD),
+    )
+    hidden_states_sharding = NamedSharding(
+        mesh, PartitionSpec(ShardingAxisName.ATTN_DATA, None)
+    )  # (T, D)
 
     # For performance consideration, refer to:
     # https://flax.readthedocs.io/en/latest/guides/performance.html
@@ -326,8 +331,10 @@ def get_flax_model(
         ),
         donate_argnums=2,  # 0 is graphdef, 1 is state, 2 is kv_cache
         static_argnums=(
-            7, 10, 11
-        ),  #7 is layer_name_to_kvcache_index, 10 is is_first_rank, 11 is is_last_rank
+            7,
+            10,
+            11,
+        ),  # 7 is layer_name_to_kvcache_index, 10 is is_first_rank, 11 is is_last_rank
     )
     def run_model(graphdef, state, *args):
         model = nnx.merge(graphdef, state)
@@ -340,15 +347,15 @@ def get_flax_model(
             hidden_states_sharding,  # residual
         ),
         donate_argnums=2,  # 0 is graphdef, 1 is state, 2 is kv_cache
-        static_argnums=(6, ),  # 6 is layer_name_to_kvcache_index
+        static_argnums=(6,),  # 6 is layer_name_to_kvcache_index
     )
     def run_draft_model(graphdef, state, *args):
         model = nnx.merge(graphdef, state)
         return model(*args)
 
     logits_sharding = NamedSharding(
-        mesh,
-        PartitionSpec(ShardingAxisName.MLP_DATA, ShardingAxisName.MLP_TENSOR))
+        mesh, PartitionSpec(ShardingAxisName.MLP_DATA, ShardingAxisName.MLP_TENSOR)
+    )
 
     @jax.jit(out_shardings=(logits_sharding))
     def run_compute_logits(graphdef, state, *args):
@@ -363,6 +370,7 @@ def get_flax_model(
         return model.embed_multimodal(**kwargs)
 
     embed_sharding = NamedSharding(mesh, PartitionSpec(None))
+
     # This function will calculates the embeddings of input texts and then merge with the image embeddings
     @jax.jit(out_shardings=(embed_sharding))
     def run_embed_input_ids(graphdef, state, *args, **kwargs):
@@ -376,21 +384,23 @@ def get_flax_model(
         return model.combine_hidden_states(hidden_states)
 
     model = nnx.merge(graphdef, state)
-    precompile_vision_encoder_fn = getattr(model, "precompile_vision_encoder",
-                                           None)
-    model_fn = functools.partial(
-        run_draft_model, graphdef) if is_draft_model else functools.partial(
-            run_model, graphdef)
+    precompile_vision_encoder_fn = getattr(model, "precompile_vision_encoder", None)
+    model_fn = (
+        functools.partial(run_draft_model, graphdef)
+        if is_draft_model
+        else functools.partial(run_model, graphdef)
+    )
     compute_logits_fn = functools.partial(run_compute_logits, graphdef)
     embed_multimodal_fn = functools.partial(run_embed_multimodal, graphdef)
     embed_input_ids_fn = functools.partial(run_embed_input_ids, graphdef)
     lora_manager, model = None, None
-    combine_hidden_states_fn = functools.partial(combine_hidden_states,
-                                                 graphdef)
+    combine_hidden_states_fn = functools.partial(combine_hidden_states, graphdef)
 
-    get_mrope_input_positions_fn = None if not hasattr(
-        jit_model,
-        "get_mrope_input_positions") else jit_model.get_mrope_input_positions
+    get_mrope_input_positions_fn = (
+        None
+        if not hasattr(jit_model, "get_mrope_input_positions")
+        else jit_model.get_mrope_input_positions
+    )
 
     multimodal_fns = MultiModalInterface(
         precompile_vision_encoder_fn=precompile_vision_encoder_fn,
@@ -480,18 +490,21 @@ def get_model(
     match impl:
         case "flax_nnx":
             with jax.set_mesh(mesh):
-                arch = getattr(vllm_config.model_config.hf_config,
-                               "architectures", [None])[0]
-                if vllm_config.parallel_config.pipeline_parallel_size > 1 and arch in _PP_DISABLED_MODELS:
+                arch = getattr(
+                    vllm_config.model_config.hf_config, "architectures", [None]
+                )[0]
+                if (
+                    vllm_config.parallel_config.pipeline_parallel_size > 1
+                    and arch in _PP_DISABLED_MODELS
+                ):
                     logger.warning(
                         "PP is not fully supported on Jax flax_nnx %s models yet, fallback to vllm models.",
-                        arch)
-                    return get_vllm_model(vllm_config, rng, mesh,
-                                          is_draft_model)
+                        arch,
+                    )
+                    return get_vllm_model(vllm_config, rng, mesh, is_draft_model)
                 try:
                     # Try to load the flax model first
-                    return get_flax_model(vllm_config, rng, mesh,
-                                          is_draft_model)
+                    return get_flax_model(vllm_config, rng, mesh, is_draft_model)
                 except UnsupportedArchitectureError as e:
                     # Convert the error message to a string to check its contents
                     error_msg = str(e)
@@ -499,16 +512,14 @@ def get_model(
                     logger.warning(error_msg)
 
                     # Fall back to the vLLM model and updating the dtype accordingly
-                    return get_vllm_model(vllm_config, rng, mesh,
-                                          is_draft_model)
+                    return get_vllm_model(vllm_config, rng, mesh, is_draft_model)
         case "vllm":
             return get_vllm_model(vllm_config, rng, mesh, is_draft_model)
         case _:
             raise NotImplementedError(f"Unsupported MODEL_IMPL_TYPE: {impl}")
 
 
-def resolve_model_architecture(vllm_config: VllmConfig,
-                               is_draft_model: bool) -> str:
+def resolve_model_architecture(vllm_config: VllmConfig, is_draft_model: bool) -> str:
     """Resolves the model implementation type.
 
     This function determines which model implementation to use based on the model
@@ -535,9 +546,15 @@ def resolve_model_architecture(vllm_config: VllmConfig,
         The model implementation type.
     """
 
-    is_runai_streamer = getattr(getattr(vllm_config, 'load_config', None),
-                                'load_format', None) == 'runai_streamer'
-    hf_config = vllm_config.speculative_config.draft_model_config.hf_config if is_draft_model else vllm_config.model_config.hf_config
+    is_runai_streamer = (
+        getattr(getattr(vllm_config, "load_config", None), "load_format", None)
+        == "runai_streamer"
+    )
+    hf_config = (
+        vllm_config.speculative_config.draft_model_config.hf_config
+        if is_draft_model
+        else vllm_config.model_config.hf_config
+    )
     if is_runai_streamer:
         try:
             # Try to get the JAX model class
@@ -545,8 +562,8 @@ def resolve_model_architecture(vllm_config: VllmConfig,
 
             # If found, check for WeightLoader capability
             if not hasattr(model_class, "WeightLoader") or not issubclass(
-                    getattr(model_class, "WeightLoader", object),
-                    BaseWeightLoader):
+                getattr(model_class, "WeightLoader", object), BaseWeightLoader
+            ):
                 return "vllm"
 
         except UnsupportedArchitectureError:
@@ -560,7 +577,8 @@ def resolve_model_architecture(vllm_config: VllmConfig,
     architectures = getattr(hf_config, "architectures", [])
     assert len(architectures) == 1, (
         f"Expected exactly one architecture, got {len(architectures)}: "
-        f"{architectures}")
+        f"{architectures}"
+    )
     arch = architectures[0]
     impl = "vllm" if arch in _VLLM_PREFERRED_ARCHITECTURES else "flax_nnx"
     return impl
@@ -583,13 +601,13 @@ def _validate_model_interface(model: Any) -> None:
     # Check for __init__ with vllm_config
     model_init = getattr(model, "__init__", None)
     if not callable(model_init):
-        raise TypeError(
-            f"Model {model.__name__} must have an __init__ method.")
+        raise TypeError(f"Model {model.__name__} must have an __init__ method.")
 
     if not supports_kw(model_init, "vllm_config"):
         raise TypeError(
             f"Model {model.__name__} __init__ method must accept a "
-            "'vllm_config' keyword argument.")
+            "'vllm_config' keyword argument."
+        )
 
     # Check for __call__ with required arguments
     model_call = getattr(model, "__call__", None)
@@ -608,13 +626,15 @@ def _validate_model_interface(model: Any) -> None:
         raise TypeError(f"Model {model.__name__} must have a __call__ method.")
 
     required_call_args = ("kv_caches", "input_ids", "attention_metadata")
-    missing_args = tuple(arg for arg in required_call_args
-                         if not supports_kw(model_call, arg))
+    missing_args = tuple(
+        arg for arg in required_call_args if not supports_kw(model_call, arg)
+    )
 
     if missing_args:
         raise TypeError(
             f"Model {model.__name__} __call__ method is missing required "
-            f"keyword arguments: {missing_args}")
+            f"keyword arguments: {missing_args}"
+        )
 
 
 def register_model(arch: str, model: Any) -> None:
@@ -676,10 +696,11 @@ def register_model(arch: str, model: Any) -> None:
             "embed_input_ids": unimplemented_embed_input_ids,
             # Prevent vLLM from trying to load weights into this dummy class.
             "load_weights": lambda self, *args, **kwargs: None,
-        })
+        },
+    )
 
     # Register the wrapped model with vLLM's registry.
     from vllm.model_executor.models.registry import ModelRegistry
+
     ModelRegistry.register_model(arch, VllmCompatibleModel)
-    logger.info(
-        f"Registered JAX model {arch} with tpu_inference and vLLM registries.")
+    logger.info(f"Registered JAX model {arch} with tpu_inference and vLLM registries.")
