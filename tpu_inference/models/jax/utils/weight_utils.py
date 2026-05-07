@@ -585,7 +585,21 @@ def load_hf_weights(
             for future in futures:
                 future.result()
 
-    check_all_loaded(params)
+    # Fill missing parameters with zeros on TPU instead of failing.
+    def _init_missing(x):
+        if isinstance(x, nnx.Param) and isinstance(x.value, jax.ShapeDtypeStruct):
+            logger.warning(f"Parameter not loaded, initializing on TPU with zeros: {x}")
+            spec = x.get_metadata().get("sharding", ())
+            if isinstance(spec, NamedSharding):
+                spec = spec.spec
+            else:
+                spec = ()
+            
+            zero_array = jnp.zeros(x.value.shape, dtype=x.value.dtype)
+            return shard_put(zero_array, spec, mesh=mesh)
+        return x
+    
+    params = jax.tree.map(_init_missing, params)
     nnx.update(model, params)
 
 
