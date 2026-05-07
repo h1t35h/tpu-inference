@@ -13,6 +13,9 @@
 # limitations under the License.
 
 from abc import abstractmethod
+from tpu_inference.logger import init_logger
+
+logger = init_logger(__name__)
 from typing import Optional, Iterable
 
 import jax
@@ -70,6 +73,14 @@ class KimiK25ForConditionalGeneration(DeepseekV3ForCausalLM):
         rng_key: jax.Array,
         mesh: Mesh
     ):
+        # Kimi K2.5 typically has only the first layer as dense (first_k_dense_replace = 1),
+        # while DeepSeek V3 defaults to 3. We override it here if it's set to default 3
+        # or not specified, to align with Kimi K2.5 architecture.
+        hf_config = vllm_config.model_config.hf_config
+        if getattr(hf_config, "first_k_dense_replace", 3) == 3:
+            logger.info("Overriding first_k_dense_replace to 1 for Kimi K2.5")
+            hf_config.first_k_dense_replace = 1
+            
         # Initialize the base DeepSeek text model
         super().__init__(vllm_config, rng_key, mesh)
         
