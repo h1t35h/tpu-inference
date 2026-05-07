@@ -602,6 +602,27 @@ def load_hf_weights(
     params = jax.tree.map(_init_missing, params)
     nnx.update(model, params)
 
+    # Move any remaining CPU parameters to TPU, avoiding replication if not sharded.
+    state = nnx.state(model)
+    def _ensure_tpu(x):
+        if isinstance(x, nnx.Param) and isinstance(x.value, jax.Array):
+            if any(d.platform == "cpu" for d in x.value.devices()):
+                spec = x.get_metadata().get("sharding", ())
+                if isinstance(spec, NamedSharding):
+                    spec = spec.spec
+                else:
+                    spec = ()
+                
+                if spec == ():
+                    logger.warning(f"Parameter has no sharding, placing on single TPU device to avoid OOM: {x}")
+                    return jax.device_put(x.value, mesh.devices.flatten()[0])
+                else:
+                    return shard_put(x.value, spec, mesh=mesh)
+        return x
+    
+    tpu_state = jax.tree.map(_ensure_tpu, state)
+    nnx.update(model, tpu_state)
+
 
 def check_all_loaded(params: nnx.State):
 
