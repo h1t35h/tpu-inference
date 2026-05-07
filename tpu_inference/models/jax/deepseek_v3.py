@@ -1320,8 +1320,10 @@ class DeepSeekV3(JaxModule):
                 prefix=f"{prefix}.layers.{layer_index}")
 
         # hf_config.num_hidden_layers is 61, which ignores the last MTP layer.
+        # TODO(hitesy) - investigate why this isn't working for the current setup.
         self.start_layer, self.end_layer, self.layers = make_layers(
-            hf_config.num_hidden_layers, get_decoder_layer)
+            getattr(hf_config, "num_hidden_layers", 61), get_decoder_layer
+        )
 
         if self.is_last_rank:
             self.norm = JaxRmsNorm(
