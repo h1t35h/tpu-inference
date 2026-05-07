@@ -116,6 +116,9 @@ class KimiK25ForConditionalGeneration(DeepseekV3ForCausalLM):
                 if "mm_projector" in key:
                     logger.warning(f"Skipping mm_projector weight: {key}")
                     continue
+                if "vision_tower" in key:
+                    logger.warning(f"Skipping vision_tower weight: {key}")
+                    continue
                 if key.startswith("language_model."):
                     yield key.removeprefix("language_model."), tensor
                 else:
