@@ -277,6 +277,29 @@ def _get_nnx_model(
                 del vllm_config.model_config.runai_model_weights_iterator
             else:
                 model.load_weights(rng)
+
+            # TODO(hitesy) get rid of it later this is a temp fix for now.
+            # Ensure all parameters are on the TPU mesh before JIT compilation.
+            # Some parameters might be left on CPU if they were not explicitly
+            # sharded during load_weights or were initialized outside the mesh.
+            from tpu_inference.models.jax.utils.weight_utils import shard_put
+
+            state = nnx.state(model)
+
+            def _ensure_tpu(x):
+                if isinstance(x, jax.Array):
+                    if any(d.platform == "cpu" for d in x.devices()):
+                        spec = ()
+                        if hasattr(x, "sharding") and isinstance(
+                            x.sharding, NamedSharding
+                        ):
+                            spec = x.sharding.spec
+                        return shard_put(x, spec, mesh=mesh)
+                return x
+
+            tpu_state = jax.tree.map(_ensure_tpu, state)
+            nnx.update(model, tpu_state)
+
             jit_model = create_jit_model(
                 model, use_qwix_on_abstract_model=should_apply_qwix_on_abstract_model
             )
