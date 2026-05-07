@@ -859,9 +859,10 @@ class JaxAutoWeightsLoader(AutoWeightsLoader):
                     reshape_dims = (N, H)
                     permute_dims = (0, 1)
                 elif "o_proj.weight" in name:
-                    N, H, D = param.value.shape
-                    reshape_dims = (D, N, H)
-                    permute_dims = (1, 2, 0)
+                    if len(param.value.shape) == 3:
+                        N, H, D = param.value.shape
+                        reshape_dims = (D, N, H)
+                        permute_dims = (1, 2, 0)
                 elif "embed_tokens.weight" in name:
                     permute_dims = (0, 1)
                 elif "lm_head" in name:
