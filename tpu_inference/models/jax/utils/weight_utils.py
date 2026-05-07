@@ -867,6 +867,8 @@ class JaxAutoWeightsLoader(AutoWeightsLoader):
                         N, H, D = param.value.shape
                         reshape_dims = (D, N, H)
                         permute_dims = (1, 2, 0)
+                    else:
+                        permute_dims = (0, 1)
                 elif any(substr in name for substr in ["down_proj.weight", "gate_proj.weight", "up_proj.weight", "kv_a_proj_with_mqa.weight", "kv_b_proj.weight", "q_a_proj.weight", "q_b_proj.weight"]):
                     permute_dims = (0, 1)
                 elif "embed_tokens.weight" in name:
