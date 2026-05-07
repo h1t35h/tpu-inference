@@ -91,13 +91,13 @@ class Int4LinearMethod(QuantizeMethodBase, common_int4.Int4LinearMethod):
         assert isinstance(layer, JaxEinsum)
         out_features = sum(self.linear_config.output_sizes)
 
-        # Weights will be packed. Shape along K dimension is halved.
-        packed_k = self.in_features // 2
-        packed_shape = (out_features, packed_k)
+        # Weights will be packed in process_weights_after_loading.
+        # Initialize with unpacked shape so the loader can fill it.
+        unpacked_shape = (out_features, self.in_features)
 
         # Initialize with dummy values, to be filled by loader.
         layer.weight = nnx.Param(
-            jnp.zeros(packed_shape, dtype=jnp.int8), eager_sharding=False
+            jnp.zeros(unpacked_shape, dtype=jnp.int8), eager_sharding=False
         )
         layer.weight.set_metadata("sharding", self.weight_sharding)
 
