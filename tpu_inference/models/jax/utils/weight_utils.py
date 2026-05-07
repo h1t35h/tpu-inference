@@ -603,25 +603,24 @@ def load_hf_weights(
     nnx.update(model, params)
 
     # Move any remaining CPU parameters to TPU, avoiding replication if not sharded.
-    state = nnx.state(model)
-    def _ensure_tpu(x):
-        if isinstance(x, nnx.Param) and isinstance(x.value, jax.Array):
-            if any(d.platform == "cpu" for d in x.value.devices()):
-                spec = x.get_metadata().get("sharding", ())
+    for name, param in model.named_parameters():
+        x = param.value
+        if isinstance(x, jax.Array):
+            if any(d.platform == "cpu" for d in x.devices()):
+                logger.warning(
+                    f"Parameter '{name}' left on CPU (shape={x.shape}, dtype={x.dtype}, devices={x.devices()}). Moving to TPU."
+                )
+                spec = param.get_metadata().get("sharding", ())
                 if isinstance(spec, NamedSharding):
                     spec = spec.spec
                 else:
                     spec = ()
                 
                 if spec == ():
-                    logger.warning(f"Parameter has no sharding, placing on single TPU device to avoid OOM: {x}")
-                    return jax.device_put(x.value, mesh.devices.flatten()[0])
+                    logger.warning(f"Parameter '{name}' has no sharding, placing on single TPU device to avoid OOM.")
+                    param.value = jax.device_put(x, mesh.devices.flatten()[0])
                 else:
-                    return shard_put(x.value, spec, mesh=mesh)
-        return x
-    
-    tpu_state = jax.tree.map(_ensure_tpu, state)
-    nnx.update(model, tpu_state)
+                    param.value = shard_put(x, spec, mesh=mesh)
 
 
 def check_all_loaded(params: nnx.State):
