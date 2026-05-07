@@ -1148,6 +1148,8 @@ class DeepSeekV3(JaxModule):
         self.is_first_rank = get_pp_group().is_first_rank
         self.is_last_rank = get_pp_group().is_last_rank
         hf_config = vllm_config.model_config.hf_config
+        if text_config := getattr(hf_config, "text_config", None):
+            hf_config = text_config
         dtype = vllm_config.model_config.dtype
         scoring_func = getattr(hf_config, "scoring_func", "sigmoid")
 
