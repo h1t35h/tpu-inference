@@ -274,7 +274,10 @@ class JaxMoE(JaxModule):
             assert len(
                 names
             ) == 3, f"Expected param name to be .<expert_id>.<param_name>.weight, got {param_name}"
-            expert_id, param_type, _ = names
+            expert_id, param_type, suffix = names
+            if suffix != "weight":
+                logger.warning(f"Skipping non-weight tensor {param_name}")
+                continue
             expert_id = int(expert_id)
             jax_param = None
             if param_type.endswith("up_proj"):
