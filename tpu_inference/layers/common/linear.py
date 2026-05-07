@@ -93,7 +93,17 @@ def sharded_quantized_matmul(x: jax.Array,
             k_dim = x.shape[1]
             sharded_num_blocks, _, __ = w_s.shape
             block_size = k_dim // sharded_num_blocks
-            output = blockwise_quantized_matmul_kernel(x,
+            
+            # Check if weights are packed int4 (shape is halved along K dimension)
+            if w_q.shape[1] == k_dim // 2:
+                from tpu_inference.kernels.quantized_matmul.int4_kernel import int4_quantized_matmul_kernel
+                output = int4_quantized_matmul_kernel(x,
+                                                       w_q,
+                                                       w_s,
+                                                       x_q_dtype=x_q_dtype,
+                                                       block_size=block_size)
+            else:
+                output = blockwise_quantized_matmul_kernel(x,
                                                        w_q,
                                                        w_s,
                                                        x_q_dtype=x_q_dtype,
