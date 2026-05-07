@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from abc import abstractmethod
-from typing import Optional
+from typing import Optional, Iterable
 
 import jax
 from flax import nnx
@@ -98,3 +98,13 @@ class KimiK25ForConditionalGeneration(DeepseekV3ForCausalLM):
         # For text-only inference or when vision is not used,
         # we delegate directly to the base DeepSeek implementation.
         return super().__call__(*args, **kwargs)
+
+    def load_weights(self, weights: Iterable) -> set[str]:
+        def _strip_language_model_prefix(w):
+            for key, tensor in w:
+                if key.startswith("language_model."):
+                    yield key.removeprefix("language_model."), tensor
+                else:
+                    yield key, tensor
+        
+        return super().load_weights(_strip_language_model_prefix(weights))
