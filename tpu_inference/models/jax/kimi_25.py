@@ -113,6 +113,9 @@ class KimiK25ForConditionalGeneration(DeepseekV3ForCausalLM):
     def load_weights(self, weights: Iterable) -> set[str]:
         def _strip_language_model_prefix(w):
             for key, tensor in w:
+                if "mm_projector" in key:
+                    logger.warning(f"Skipping mm_projector weight: {key}")
+                    continue
                 if key.startswith("language_model."):
                     yield key.removeprefix("language_model."), tensor
                 else:
