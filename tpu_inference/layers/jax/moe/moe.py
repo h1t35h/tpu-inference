@@ -270,6 +270,7 @@ class JaxMoE(JaxModule):
             param_name: str = param_name.split(
                 self.prefix)[-1]  # ".0.down_proj.weight" for example
             names = param_name.split(".")
+            logger.info(f"moe load_weights: param_name={param_name}, names={names}, prefix={self.prefix}")
             assert len(
                 names
             ) == 3, f"Expected param name to be .<expert_id>.<param_name>.weight, got {param_name}"
