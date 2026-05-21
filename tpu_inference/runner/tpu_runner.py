@@ -1644,6 +1644,14 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             (self.max_num_reqs + dp_size, ), key="query_start_loc")
         seq_lens_view = self.device_buffer.get_view((self.max_num_reqs, ),
                                                     key="seq_lens")
+        if not self.uses_mrope:
+            positions_view = self.device_buffer.get_view(
+                (padded_total_num_scheduled_tokens, ), key="positions")
+        request_distribution_view = self.device_buffer.get_view(
+            (dp_size * 3, ), key="request_distribution")
+        if self.kv_cache_config.has_mamba_layers:
+            mamba_state_indices_view = self.device_buffer.get_view(
+                (self.max_num_reqs, ), key="mamba_state_indices")
 
         use_spec_decode = len(
             scheduler_output.scheduled_spec_decode_tokens) > 0
@@ -1680,9 +1688,14 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             input_ids_cpu = input_ids_view[
                 token_offset:token_offset +
                 padded_num_scheduled_tokens_per_dp_rank]
-            positions_cpu = self.positions_cpu[
-                token_offset:token_offset +
-                padded_num_scheduled_tokens_per_dp_rank]
+            if not self.uses_mrope:
+                positions_cpu = positions_view[
+                    token_offset:token_offset +
+                    padded_num_scheduled_tokens_per_dp_rank]
+            else:
+                positions_cpu = self.positions_cpu[
+                    token_offset:token_offset +
+                    padded_num_scheduled_tokens_per_dp_rank]
             # Get request indices.
             # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
             # For each scheduled token, what are the corresponding req index.
@@ -1785,8 +1798,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                     num_decode_in_dp_rank += 1
             _request_distribution.append(
                 [num_decode_in_dp_rank, num_decode_in_dp_rank, _num_reqs])
-        request_distribution = np.array(_request_distribution,
-                                        dtype=np.int32).ravel()
+        request_distribution_view[:] = np.array(_request_distribution,
+                                                dtype=np.int32).ravel()
 
         use_spec_decode = len(
             scheduler_output.scheduled_spec_decode_tokens) > 0
@@ -1819,9 +1832,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                                      mrope_positions,
                                      sharding=mrope_sharding)
         else:
-            positions = device_array(self.mesh,
-                                     positions,
-                                     sharding=data_parallel_attn_sharding)
+            positions = None
 
         # Collect block tables host arrays loops zone presence zones legality
         def build_block_table_host(kv_cache_gid: int) -> None:
@@ -1868,8 +1879,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             # and convert global slot ids to rank-local indices so they
             # index correctly into the per-rank shard of the mamba state.
             local_slots = self.input_batch._mamba_local_slots
-            mamba_state_indices_cpu = np.zeros(self.max_num_reqs,
-                                               dtype=np.int32)
+            mamba_state_indices_view.fill(0)
             for dp_rank in range(dp_size):
                 _num_reqs = num_req_per_dp_rank[dp_rank]
                 if _num_reqs == 0:
@@ -1877,26 +1887,30 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 req_offset = dp_rank * max_num_reqs_per_dp_rank
                 global_slots = self.input_batch.mamba_state_indices_cpu[
                     req_indices_dp[dp_rank]]
-                mamba_state_indices_cpu[req_offset:req_offset +
-                                        _num_reqs] = (global_slots %
-                                                      local_slots)
-            (request_distribution, mamba_state_indices,
-             dev_arrays_payload) = device_array(
-                 self.mesh, (request_distribution, mamba_state_indices_cpu,
-                             metadata_blob),
-                 sharding=data_parallel_attn_sharding)
-        else:
-            mamba_state_indices = None
-            (request_distribution, dev_arrays_payload) = device_array(
-                self.mesh, (request_distribution, metadata_blob),
-                sharding=data_parallel_attn_sharding)
+                mamba_state_indices_view[req_offset:req_offset +
+                                         _num_reqs] = (global_slots %
+                                                       local_slots)
+
+        dev_arrays_payload = device_array(
+            self.mesh, metadata_blob,
+            sharding=data_parallel_attn_sharding)
 
         metadata = common_utils.DeviceBuffer.unpack_arrays(
             dev_arrays_payload, metadata_layout)
+        
         input_ids = metadata["input_ids"]
         query_start_loc = metadata["query_start_loc"]
         seq_lens = metadata["seq_lens"]
         logits_indices = metadata["logits_indices"]
+        request_distribution = metadata["request_distribution"]
+        
+        if self.kv_cache_config.has_mamba_layers:
+            mamba_state_indices = metadata["mamba_state_indices"]
+        else:
+            mamba_state_indices = None
+            
+        if not self.uses_mrope:
+            positions = metadata["positions"]
 
         # The host-side `num_computed_tokens_cpu` assumes all speculatively
         # proposed tokens from the previous step were accepted. Subtract the
