@@ -3,7 +3,7 @@ import time
 from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
-from functools import wraps
+from functools import partial, wraps
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import jax
@@ -488,6 +488,7 @@ class DeviceBuffer:
         self._sizes = []
 
     @staticmethod
+    @partial(jax.jit, static_argnums=(1,))
     def unpack_arrays(blob: jax.Array,
                       metadata: DeviceBufferMetadata) -> Dict[str, jax.Array]:
         """
