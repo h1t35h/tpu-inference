@@ -292,6 +292,16 @@ class CompilationManager:
             
             logits_indices = self._create_dummy_tensor((logits_indices_size, ), jnp.int32, dp_sharding)
             
+            @functools.partial(
+                jax.jit,
+                static_argnums=(6, 9, 10),
+                compiler_options={
+                    "xla_tpu_all_gather_collective_matmul_mode":
+                    "post_spmd_conservative",
+                    "xla_tpu_reduce_scatter_collective_matmul_mode":
+                    "post_spmd_conservative"
+                }
+            )
             def fused_wrapper(
                 state_leaves,
                 kv_caches,
@@ -344,6 +354,7 @@ class CompilationManager:
                     logits_indices,
                     num_tokens=num_tokens,
                     num_reqs=num_reqs,
+                    _compile=False,
                 )
         else:
             def model_fn_wrapper(

@@ -19,6 +19,8 @@ from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Dict, List, Optional, Tuple, cast
 
+import os
+os.environ["FUSE_MODEL_LOGITS"] = "1"
 import jax
 import jax.numpy as jnp
 import jaxtyping
@@ -1378,6 +1380,12 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
     @functools.partial(
         jax.jit,
         static_argnums=(0, 7, 10, 11),
+        compiler_options={
+            "xla_tpu_all_gather_collective_matmul_mode":
+            "post_spmd_conservative",
+            "xla_tpu_reduce_scatter_collective_matmul_mode":
+            "post_spmd_conservative"
+        }
     )
     def _fused_model_logits_fn(
         self,

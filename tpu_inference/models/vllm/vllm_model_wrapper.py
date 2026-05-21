@@ -276,27 +276,33 @@ class VllmModelWrapper:
 
     def jit_step_func(self):
 
-        @jax.jit(
-            donate_argnames=("kv_caches", ),
-            out_shardings=(
+        import os
+        from functools import partial
+
+        jit_kwargs = {
+            "donate_argnames": ("kv_caches", ),
+            "out_shardings": (
                 None,  # kv_caches - keep original sharding
                 NamedSharding(self.mesh,
-                              PartitionSpec(ShardingAxisName.ATTN_DATA, None)),
+                               PartitionSpec(ShardingAxisName.ATTN_DATA, None)),
                 None,  # empty list
                 None,  # expert ids
             ),
-            compiler_options={
-                "xla_tpu_all_gather_collective_matmul_mode":
-                "post_spmd_conservative",
-                "xla_tpu_reduce_scatter_collective_matmul_mode":
-                "post_spmd_conservative"
-            },
-            static_argnames=(
+            "static_argnames": (
                 "layer_name_to_kvcache_index",
                 "is_first_rank",
                 "is_last_rank",
             ),
-        )
+        }
+        if not os.getenv("FUSE_MODEL_LOGITS"):
+            jit_kwargs["compiler_options"] = {
+                "xla_tpu_all_gather_collective_matmul_mode":
+                "post_spmd_conservative",
+                "xla_tpu_reduce_scatter_collective_matmul_mode":
+                "post_spmd_conservative"
+            }
+
+        @partial(jax.jit, **jit_kwargs)
         def step_fun(
             params_and_buffers,  # This has been wrapped into torchax TorchValue
             kv_caches: List[jax.Array],
