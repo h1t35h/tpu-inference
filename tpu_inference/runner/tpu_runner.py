@@ -21,6 +21,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, cast
 
 import os
 os.environ["FUSE_MODEL_LOGITS"] = "1"
+import os
+os.environ["FUSE_MODEL_LOGITS"] = "1"
 import jax
 import jax.numpy as jnp
 import jaxtyping
@@ -187,6 +189,7 @@ class ExecuteModelState:
     padded_num_reqs: Optional[int] = None
     expert_indices: Optional[jax.Array] = None
     full_hidden_states: Optional[jax.Array] = None
+    next_tokens: Optional[jax.Array] = None
 
 
 @jax.jit(donate_argnums=(0, 1, 2))
@@ -788,6 +791,27 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             # This can happen in pipeline parallel case.
             return EMPTY_MODEL_RUNNER_OUTPUT
 
+        if self.execute_model_state.next_tokens is not None and grammar_output is None:
+            next_tokens = self.execute_model_state.next_tokens
+            logits_indices_selector = self.execute_model_state.logits_indices_selector
+            num_reqs = self.input_batch.num_reqs
+            
+            next_tokens_cpu = np.asarray(jax.device_get(next_tokens))
+            if logits_indices_selector is not None:
+                next_tokens_cpu = next_tokens_cpu[logits_indices_selector]
+            selected_token_ids = np.expand_dims(next_tokens_cpu[:num_reqs], 1)
+            valid_sampled_token_ids = selected_token_ids.tolist()
+            
+            self.execute_model_state = None
+            
+            return ModelRunnerOutput(
+                req_ids=self.input_batch.req_ids,
+                req_id_to_index=self.input_batch.req_id_to_index,
+                sampled_token_ids=valid_sampled_token_ids,
+                logprobs=None,
+                prompt_logprobs_dict={},
+            )
+
         (scheduler_output, attn_metadata, sampling_metadata, input_ids,
          hidden_states, logits, aux_hidden_states, spec_decode_metadata,
          kv_connector_output, logits_indices_selector, padded_num_reqs,
@@ -978,28 +1002,63 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         # but text-only model will use input_ids
         with self.maybe_forbid_compile:
             if not self.is_pooling_model and self.is_last_rank:
-                with set_forward_context(
-                        None,
-                        self.vllm_config,
-                ), self.maybe_get_kv_connector_output(
-                        scheduler_output) as kv_connector_output:
-                    (self.kv_caches, logits, aux_hidden_states, expert_indices,
-                     full_hidden_states) = self._fused_model_logits_fn(
-                         self.state_leaves,
-                         self.kv_caches,
-                         input_ids,
-                         attn_metadata,
-                         inputs_embeds,
-                         input_positions,
-                         tuple(self.layer_name_to_kvcache_index.items()),
-                         lora_metadata,
-                         intermediate_tensors,
-                         self.is_first_rank,
-                         self.is_last_rank,
-                         logits_indices,
-                     )
-                hidden_states = logits
+                use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
+                # We can only run the fully fused model + logits + sampler if speculative decoding is NOT active
+                if not use_spec_decode:
+                    if sampling_metadata.do_sampling:
+                        self.rng_params_for_sampling, step_rng = jax.random.split(
+                            self.rng_params_for_sampling)
+                    else:
+                        step_rng = self.rng_params_for_sampling
+                        
+                    with set_forward_context(
+                            None,
+                            self.vllm_config,
+                    ), self.maybe_get_kv_connector_output(
+                            scheduler_output) as kv_connector_output:
+                        (self.kv_caches, logits, aux_hidden_states, expert_indices,
+                         full_hidden_states, next_tokens) = self._fused_model_logits_sampler_fn(
+                             self.state_leaves,
+                             self.kv_caches,
+                             input_ids,
+                             attn_metadata,
+                             inputs_embeds,
+                             input_positions,
+                             tuple(self.layer_name_to_kvcache_index.items()),
+                             lora_metadata,
+                             intermediate_tensors,
+                             self.is_first_rank,
+                             self.is_last_rank,
+                             logits_indices,
+                             step_rng,
+                             sampling_metadata,
+                         )
+                    hidden_states = logits
+                else:
+                    next_tokens = None
+                    with set_forward_context(
+                            None,
+                            self.vllm_config,
+                    ), self.maybe_get_kv_connector_output(
+                            scheduler_output) as kv_connector_output:
+                        (self.kv_caches, logits, aux_hidden_states, expert_indices,
+                         full_hidden_states) = self._fused_model_logits_fn(
+                             self.state_leaves,
+                             self.kv_caches,
+                             input_ids,
+                             attn_metadata,
+                             inputs_embeds,
+                             input_positions,
+                             tuple(self.layer_name_to_kvcache_index.items()),
+                             lora_metadata,
+                             intermediate_tensors,
+                             self.is_first_rank,
+                             self.is_last_rank,
+                             logits_indices,
+                         )
+                    hidden_states = logits
             else:
+                next_tokens = None
                 with set_forward_context(
                         None,
                         self.vllm_config,
@@ -1082,7 +1141,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             logits_indices_selector=logits_indices_selector,
             padded_num_reqs=padded_num_reqs,
             expert_indices=expert_indices,
-            full_hidden_states=full_hidden_states)
+            full_hidden_states=full_hidden_states,
+            next_tokens=next_tokens,
+        )
         return None
 
     def _sample_from_logits(
@@ -1423,6 +1484,62 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             lora_metadata,
         )
         return kv_caches, logits, aux_hidden_states, expert_indices, hidden_states
+
+
+    @functools.partial(
+        jax.jit,
+        static_argnums=(0, 7, 10, 11),
+        compiler_options={
+            "xla_tpu_all_gather_collective_matmul_mode":
+            "post_spmd_conservative",
+            "xla_tpu_reduce_scatter_collective_matmul_mode":
+            "post_spmd_conservative"
+        }
+    )
+    def _fused_model_logits_sampler_fn(
+        self,
+        state_leaves,
+        kv_caches,
+        input_ids,
+        attn_metadata,
+        inputs_embeds,
+        input_positions,
+        layer_name_to_kvcache_index,
+        lora_metadata,
+        intermediate_tensors,
+        is_first_rank,
+        is_last_rank,
+        logits_indices,
+        step_rng,
+        tpu_sampling_metadata,
+    ):
+        kv_caches, hidden_states, aux_hidden_states, expert_indices = self.model_fn(
+            state_leaves,
+            kv_caches,
+            input_ids,
+            attn_metadata,
+            inputs_embeds,
+            input_positions,
+            layer_name_to_kvcache_index,
+            lora_metadata,
+            intermediate_tensors,
+            is_first_rank,
+            is_last_rank,
+        )
+        selected_hidden_states = self._select_from_array_fn(hidden_states,
+                                                            logits_indices)
+        logits = self.compute_logits_fn(
+            state_leaves,
+            selected_hidden_states,
+            lora_metadata,
+        )
+        next_tokens, ret_logits = sample(
+            step_rng,
+            self.mesh,
+            logits,
+            tpu_sampling_metadata,
+        )
+        return kv_caches, ret_logits, aux_hidden_states, expert_indices, hidden_states, next_tokens
 
     @staticmethod
     @jax.jit(static_argnames=("max_logprobs", ))

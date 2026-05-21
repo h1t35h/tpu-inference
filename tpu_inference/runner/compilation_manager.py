@@ -356,6 +356,89 @@ class CompilationManager:
                     num_reqs=num_reqs,
                     _compile=False,
                 )
+
+            # Fused Backbone + Logits + Sampler JIT precompilation
+            logprobs = False
+            dummy_shape = (2, )
+            _cache_collision_dummy = jnp.zeros(dummy_shape, dtype=jnp.int32)
+            _cache_collision_dummy = device_array(self.runner.mesh, _cache_collision_dummy)
+            dummy_sampling_metadata = TPUSupportedSamplingMetadata(
+                _cache_collision_dummy=_cache_collision_dummy,
+                do_sampling=False,
+                logprobs=logprobs,
+            )
+            dummy_step_rng = self.runner.rng_params_for_sampling
+            
+            @functools.partial(
+                jax.jit,
+                static_argnums=(6, 9, 10),
+                compiler_options={
+                    "xla_tpu_all_gather_collective_matmul_mode":
+                    "post_spmd_conservative",
+                    "xla_tpu_reduce_scatter_collective_matmul_mode":
+                    "post_spmd_conservative"
+                }
+            )
+            def fused_sampler_wrapper(
+                state_leaves,
+                kv_caches,
+                input_ids,
+                attention_metadata,
+                positions,
+                inputs_embeds,
+                layer_name_to_kvcache_index,
+                lora_metadata,
+                intermediate_tensors,
+                is_first_rank,
+                is_last_rank,
+                logits_indices,
+                step_rng,
+                tpu_sampling_metadata,
+            ):
+                kv_caches, logits, aux_hidden_states, expert_indices, hidden_states, next_tokens = self.runner._fused_model_logits_sampler_fn(
+                    state_leaves,
+                    kv_caches,
+                    input_ids,
+                    attention_metadata,
+                    inputs_embeds,
+                    positions,
+                    layer_name_to_kvcache_index,
+                    lora_metadata,
+                    intermediate_tensors,
+                    is_first_rank,
+                    is_last_rank,
+                    logits_indices,
+                    step_rng,
+                    tpu_sampling_metadata,
+                )
+                self.runner.kv_caches = kv_caches
+                return next_tokens
+
+            with self.runner.maybe_select_dummy_loras(
+                    self.runner.lora_config, np.array([num_tokens],
+                                                      dtype=np.int32)):
+                lora_metadata = self.runner.lora_utils.extract_lora_metadata()
+                self._run_compilation(
+                    name + " (fused_sampler)",
+                    fused_sampler_wrapper,
+                    self.runner.state_leaves,
+                    self.runner.kv_caches,
+                    input_ids,
+                    attention_metadata,
+                    positions,
+                    inputs_embeds,
+                    tuple(self.runner.layer_name_to_kvcache_index.items()),
+                    lora_metadata,
+                    intermediate_tensors,
+                    is_first_rank,
+                    is_last_rank,
+                    logits_indices,
+                    dummy_step_rng,
+                    dummy_sampling_metadata,
+                    num_tokens=num_tokens,
+                    num_reqs=num_reqs,
+                    _compile=False,
+                )
         else:
             def model_fn_wrapper(
                 state_leaves,
