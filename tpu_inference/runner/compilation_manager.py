@@ -283,48 +283,111 @@ class CompilationManager:
                 for name in kv_cache_group.layer_names
             }
 
-        def model_fn_wrapper(
-            state_leaves,
-            kv_caches,
-            input_ids,
-            attention_metadata,
-            positions,
-            inputs_embeds,
-            layer_name_to_kvcache_index,
-            lora_metadata,
-            intermediate_tensors,
-            is_first_rank,
-            is_last_rank,
-        ):
-            kv_caches, hidden_states, *_ = self.runner.model_fn(
-                state_leaves, kv_caches, input_ids, attention_metadata,
-                inputs_embeds, positions, layer_name_to_kvcache_index,
-                lora_metadata, intermediate_tensors, is_first_rank,
-                is_last_rank)
-            self.runner.kv_caches = kv_caches
-            return hidden_states
-
-        with self.runner.maybe_select_dummy_loras(
-                self.runner.lora_config, np.array([num_tokens],
-                                                  dtype=np.int32)):
-            lora_metadata = self.runner.lora_utils.extract_lora_metadata()
-            self._run_compilation(
-                name,
-                model_fn_wrapper,
-                self.runner.state_leaves,
-                self.runner.kv_caches,
+        if not self.runner.is_pooling_model and is_last_rank:
+            if self.runner.speculative_config:
+                num_spec_tokens = self.runner.speculative_config.num_speculative_tokens
+                logits_indices_size = num_reqs * (num_spec_tokens + 1)
+            else:
+                logits_indices_size = num_reqs
+            
+            logits_indices = self._create_dummy_tensor((logits_indices_size, ), jnp.int32, dp_sharding)
+            
+            def fused_wrapper(
+                state_leaves,
+                kv_caches,
                 input_ids,
                 attention_metadata,
                 positions,
                 inputs_embeds,
-                tuple(self.runner.layer_name_to_kvcache_index.items()),
+                layer_name_to_kvcache_index,
                 lora_metadata,
                 intermediate_tensors,
                 is_first_rank,
                 is_last_rank,
-                num_tokens=num_tokens,
-                num_reqs=num_reqs,
-            )
+                logits_indices,
+            ):
+                kv_caches, logits, aux_hidden_states, expert_indices, hidden_states = self.runner._fused_model_logits_fn(
+                    state_leaves,
+                    kv_caches,
+                    input_ids,
+                    attention_metadata,
+                    inputs_embeds,
+                    positions,
+                    layer_name_to_kvcache_index,
+                    lora_metadata,
+                    intermediate_tensors,
+                    is_first_rank,
+                    is_last_rank,
+                    logits_indices,
+                )
+                self.runner.kv_caches = kv_caches
+                return logits
+
+            with self.runner.maybe_select_dummy_loras(
+                    self.runner.lora_config, np.array([num_tokens],
+                                                      dtype=np.int32)):
+                lora_metadata = self.runner.lora_utils.extract_lora_metadata()
+                self._run_compilation(
+                    name + " (fused)",
+                    fused_wrapper,
+                    self.runner.state_leaves,
+                    self.runner.kv_caches,
+                    input_ids,
+                    attention_metadata,
+                    positions,
+                    inputs_embeds,
+                    tuple(self.runner.layer_name_to_kvcache_index.items()),
+                    lora_metadata,
+                    intermediate_tensors,
+                    is_first_rank,
+                    is_last_rank,
+                    logits_indices,
+                    num_tokens=num_tokens,
+                    num_reqs=num_reqs,
+                )
+        else:
+            def model_fn_wrapper(
+                state_leaves,
+                kv_caches,
+                input_ids,
+                attention_metadata,
+                positions,
+                inputs_embeds,
+                layer_name_to_kvcache_index,
+                lora_metadata,
+                intermediate_tensors,
+                is_first_rank,
+                is_last_rank,
+            ):
+                kv_caches, hidden_states, *_ = self.runner.model_fn(
+                    state_leaves, kv_caches, input_ids, attention_metadata,
+                    inputs_embeds, positions, layer_name_to_kvcache_index,
+                    lora_metadata, intermediate_tensors, is_first_rank,
+                    is_last_rank)
+                self.runner.kv_caches = kv_caches
+                return hidden_states
+
+            with self.runner.maybe_select_dummy_loras(
+                    self.runner.lora_config, np.array([num_tokens],
+                                                      dtype=np.int32)):
+                lora_metadata = self.runner.lora_utils.extract_lora_metadata()
+                self._run_compilation(
+                    name,
+                    model_fn_wrapper,
+                    self.runner.state_leaves,
+                    self.runner.kv_caches,
+                    input_ids,
+                    attention_metadata,
+                    positions,
+                    inputs_embeds,
+                    tuple(self.runner.layer_name_to_kvcache_index.items()),
+                    lora_metadata,
+                    intermediate_tensors,
+                    is_first_rank,
+                    is_last_rank,
+                    num_tokens=num_tokens,
+                    num_reqs=num_reqs,
+                )
 
     def _precompile_substitute_placeholder_token(self) -> None:
         dp_sharding = NamedSharding(

@@ -975,33 +975,53 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         # NOTE: right now, mm model will use embeddings as the input,
         # but text-only model will use input_ids
         with self.maybe_forbid_compile:
-
-            with set_forward_context(
-                    None,
-                    self.vllm_config,
-            ), self.maybe_get_kv_connector_output(
-                    scheduler_output) as kv_connector_output:
-                # NOTE(Wenlong): It takes both `input_ids` and `inputs_embeds`,
-                # but one of them would be `None`
-                (self.kv_caches, hidden_states, aux_hidden_states,
-                 expert_indices) = self.model_fn(
-                     self.state_leaves,
-                     self.kv_caches,
-                     input_ids,
-                     attn_metadata,
-                     inputs_embeds,
-                     input_positions,
-                     tuple(self.layer_name_to_kvcache_index.items()),
-                     lora_metadata,
-                     intermediate_tensors,
-                     self.is_first_rank,
-                     self.is_last_rank,
-                 )
-            if not self.is_last_rank:
-                assert isinstance(hidden_states, JaxIntermediateTensors)
-                hidden_states.kv_connector_output = kv_connector_output
-                hidden_states.expert_indices = expert_indices
-                return hidden_states
+            if not self.is_pooling_model and self.is_last_rank:
+                with set_forward_context(
+                        None,
+                        self.vllm_config,
+                ), self.maybe_get_kv_connector_output(
+                        scheduler_output) as kv_connector_output:
+                    (self.kv_caches, logits, aux_hidden_states, expert_indices,
+                     full_hidden_states) = self._fused_model_logits_fn(
+                         self.state_leaves,
+                         self.kv_caches,
+                         input_ids,
+                         attn_metadata,
+                         inputs_embeds,
+                         input_positions,
+                         tuple(self.layer_name_to_kvcache_index.items()),
+                         lora_metadata,
+                         intermediate_tensors,
+                         self.is_first_rank,
+                         self.is_last_rank,
+                         logits_indices,
+                     )
+                hidden_states = logits
+            else:
+                with set_forward_context(
+                        None,
+                        self.vllm_config,
+                ), self.maybe_get_kv_connector_output(
+                        scheduler_output) as kv_connector_output:
+                    (self.kv_caches, hidden_states, aux_hidden_states,
+                     expert_indices) = self.model_fn(
+                         self.state_leaves,
+                         self.kv_caches,
+                         input_ids,
+                         attn_metadata,
+                         inputs_embeds,
+                         input_positions,
+                         tuple(self.layer_name_to_kvcache_index.items()),
+                         lora_metadata,
+                         intermediate_tensors,
+                         self.is_first_rank,
+                         self.is_last_rank,
+                     )
+                if not self.is_last_rank:
+                    assert isinstance(hidden_states, JaxIntermediateTensors)
+                    hidden_states.kv_connector_output = kv_connector_output
+                    hidden_states.expert_indices = expert_indices
+                    return hidden_states
 
         if self.is_pooling_model:
             num_reqs = self.input_batch.num_reqs
@@ -1037,14 +1057,15 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 pooler_output=pooler_output,
             )
 
-        full_hidden_states = hidden_states
-        hidden_states = self._select_from_array_fn(hidden_states,
-                                                   logits_indices)
-        logits = self.compute_logits_fn(
-            self.state_leaves,
-            hidden_states,
-            lora_metadata,
-        )
+        if not (not self.is_pooling_model and self.is_last_rank):
+            full_hidden_states = hidden_states
+            hidden_states = self._select_from_array_fn(hidden_states,
+                                                       logits_indices)
+            logits = self.compute_logits_fn(
+                self.state_leaves,
+                hidden_states,
+                lora_metadata,
+            )
 
         self.execute_model_state = ExecuteModelState(
             scheduler_output=scheduler_output,
@@ -1353,6 +1374,47 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 array, indices_to_select)
 
         return ret
+
+    @functools.partial(
+        jax.jit,
+        static_argnums=(0, 7, 10, 11),
+    )
+    def _fused_model_logits_fn(
+        self,
+        state_leaves,
+        kv_caches,
+        input_ids,
+        attn_metadata,
+        inputs_embeds,
+        input_positions,
+        layer_name_to_kvcache_index,
+        lora_metadata,
+        intermediate_tensors,
+        is_first_rank,
+        is_last_rank,
+        logits_indices,
+    ):
+        kv_caches, hidden_states, aux_hidden_states, expert_indices = self.model_fn(
+            state_leaves,
+            kv_caches,
+            input_ids,
+            attn_metadata,
+            inputs_embeds,
+            input_positions,
+            layer_name_to_kvcache_index,
+            lora_metadata,
+            intermediate_tensors,
+            is_first_rank,
+            is_last_rank,
+        )
+        selected_hidden_states = self._select_from_array_fn(hidden_states,
+                                                            logits_indices)
+        logits = self.compute_logits_fn(
+            state_leaves,
+            selected_hidden_states,
+            lora_metadata,
+        )
+        return kv_caches, logits, aux_hidden_states, expert_indices, hidden_states
 
     @staticmethod
     @jax.jit(static_argnames=("max_logprobs", ))
