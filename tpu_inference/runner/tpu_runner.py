@@ -1257,15 +1257,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 runner=self)
             return async_model_runner_output
 
-        with jax.profiler.TraceAnnotation("host_extract_sampled_tokens"):
-            valid_sampled_token_ids = runner_utils.host_extract_sampled_tokens(
-                self,
-                spec_decode_metadata,
-                next_tokens,
-                logits_indices_selector,
-                discard_sampled_tokens_req_indices,
-                num_reqs,
-            )
+        valid_sampled_token_ids = runner_utils.host_extract_sampled_tokens(
+            self, spec_decode_metadata, next_tokens, logits_indices_selector,
+            discard_sampled_tokens_req_indices, num_reqs)
 
         # Append sampled tokens
         for req_idx, req_state, _ in request_seq_lens:
@@ -1304,8 +1298,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         )
 
         if expert_indices is not None:
-            with jax.profiler.TraceAnnotation("device_get_expert_indices"):
-                expert_indices_cpu = np.asarray(jax.device_get(expert_indices))
+            expert_indices_cpu = np.asarray(jax.device_get(expert_indices))
 
             routed_experts_dict = {}
             current_token_offset = 0
@@ -1594,497 +1587,422 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         return seq_lens, positions
 
     def _prepare_inputs(self, scheduler_output: "VllmSchedulerOutput"):
-        with jax.profiler.TraceAnnotation("_prepare_inputs"):
-            total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
-            assert total_num_scheduled_tokens > 0
-            num_reqs = self.input_batch.num_reqs
-            assert num_reqs > 0
+        total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        assert total_num_scheduled_tokens > 0
+        num_reqs = self.input_batch.num_reqs
+        assert num_reqs > 0
 
-            dp_size = self.dp_size
-            if self.speculative_config and dp_size > 1:
-                assert "Spec decoding not yet support when dp > 1"
+        dp_size = self.dp_size
+        if self.speculative_config and dp_size > 1:
+            assert "Spec decoding not yet support when dp > 1"
 
-            data_parallel_attn_sharding = NamedSharding(
-                self.mesh, PartitionSpec(ShardingAxisName.ATTN_DATA)
-            )
+        data_parallel_attn_sharding = NamedSharding(
+            self.mesh, PartitionSpec(ShardingAxisName.ATTN_DATA))
 
-            (
-                req_ids_dp,
-                req_indices_dp,
-                num_scheduled_tokens_per_dp_rank,
-                scheduled_tokens_per_dp_rank,
-                num_req_per_dp_rank,
-                padded_num_scheduled_tokens_per_dp_rank,
-                padded_num_reqs,
-                attn_padded_num_reqs,
-                padded_total_num_scheduled_tokens,
-                padded_num_reqs_per_dp_rank,
-                logits_indices_selector,
-                max_num_reqs_per_dp_rank,
-            ) = self._prepare_input_metadata(scheduler_output)
-            # Multi-modal support
-            # Calculate M-RoPE positions.
-            # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
-            if self.uses_mrope:
-                self.mm_manager.calc_mrope_positions(
-                    scheduler_output,
-                    req_ids_dp,
-                    padded_num_scheduled_tokens_per_dp_rank,
-                )
+        (req_ids_dp, req_indices_dp, num_scheduled_tokens_per_dp_rank,
+         scheduled_tokens_per_dp_rank, num_req_per_dp_rank,
+         padded_num_scheduled_tokens_per_dp_rank, padded_num_reqs,
+         attn_padded_num_reqs, padded_total_num_scheduled_tokens,
+         padded_num_reqs_per_dp_rank, logits_indices_selector,
+         max_num_reqs_per_dp_rank
+         ) = self._prepare_input_metadata(scheduler_output)
+        # Multi-modal support
+        # Calculate M-RoPE positions.
+        # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
+        if self.uses_mrope:
+            self.mm_manager.calc_mrope_positions(
+                scheduler_output, req_ids_dp,
+                padded_num_scheduled_tokens_per_dp_rank)
 
-            # Async scheduling: prepare token substitution indices for DP
+        # Async scheduling: prepare token substitution indices for DP
+        num_draft_tokens = np.zeros(num_reqs, dtype=np.int32)
+        for (req_id, draft_token_ids
+             ) in scheduler_output.scheduled_spec_decode_tokens.items():
+            req_idx = self.input_batch.req_id_to_index[req_id]
+            num_draft_tokens[req_idx] = len(draft_token_ids)
+        token_in_tpu_cur_input_indices_dp = {}
+        token_in_tpu_pre_next_tokens_indices_dp = {}
+        draft_token_in_tpu_cur_indices_dp = {}
+        draft_token_in_prev_next_tokens_indices_dp = {}
+        if self.scheduler_config.async_scheduling and self._pre_async_results is not None:
+            # If async previous results exists, we will prepare for the token substitution here
+            # The actual substitution will be performed in tpu during later parts of this function.
+            (token_in_tpu_cur_input_indices_dp,
+             token_in_tpu_pre_next_tokens_indices_dp,
+             draft_token_in_tpu_cur_indices_dp,
+             draft_token_in_prev_next_tokens_indices_dp
+             ) = self._prepare_async_token_substitution_indices(
+                 req_ids_dp, scheduled_tokens_per_dp_rank,
+                 padded_num_scheduled_tokens_per_dp_rank,
+                 {0: num_draft_tokens}, dp_size)
+
+        self.device_buffer.reset()
+
+        input_ids_view = self.device_buffer.get_view(
+            (padded_total_num_scheduled_tokens, ), key="input_ids")
+        query_start_loc_view = self.device_buffer.get_view(
+            (self.max_num_reqs + dp_size, ), key="query_start_loc")
+        seq_lens_view = self.device_buffer.get_view((self.max_num_reqs, ),
+                                                    key="seq_lens")
+
+        use_spec_decode = len(
+            scheduler_output.scheduled_spec_decode_tokens) > 0
+
+        if use_spec_decode:
             num_draft_tokens = np.zeros(num_reqs, dtype=np.int32)
             for (
-                req_id,
-                draft_token_ids,
+                    req_id,
+                    draft_token_ids,
             ) in scheduler_output.scheduled_spec_decode_tokens.items():
                 req_idx = self.input_batch.req_id_to_index[req_id]
                 num_draft_tokens[req_idx] = len(draft_token_ids)
-            token_in_tpu_cur_input_indices_dp = {}
-            token_in_tpu_pre_next_tokens_indices_dp = {}
-            draft_token_in_tpu_cur_indices_dp = {}
-            draft_token_in_prev_next_tokens_indices_dp = {}
-            if (
-                self.scheduler_config.async_scheduling
-                and self._pre_async_results is not None
-            ):
-                # If async previous results exists, we will prepare for the token substitution here
-                # The actual substitution will be performed in tpu during later parts of this function.
-                (
-                    token_in_tpu_cur_input_indices_dp,
-                    token_in_tpu_pre_next_tokens_indices_dp,
-                    draft_token_in_tpu_cur_indices_dp,
-                    draft_token_in_prev_next_tokens_indices_dp,
-                ) = self._prepare_async_token_substitution_indices(
-                    req_ids_dp,
-                    scheduled_tokens_per_dp_rank,
-                    padded_num_scheduled_tokens_per_dp_rank,
-                    {0: num_draft_tokens},
-                    dp_size,
-                )
 
-            self.device_buffer.reset()
+            num_sampled_tokens = num_draft_tokens + 1
+            total_sampled_tokens = np.sum(num_sampled_tokens)
+            padded_logits_length = runner_utils.get_padded_token_len(
+                self.num_logits_paddings, total_sampled_tokens)
+            logits_indices_shape = (padded_logits_length, )
+        else:
+            logits_indices_shape = (padded_num_reqs, )
 
-            input_ids_view = self.device_buffer.get_view(
-                (padded_total_num_scheduled_tokens,), key="input_ids"
+        logits_indices_view = self.device_buffer.get_view(logits_indices_shape,
+                                                          key="logits_indices")
+
+        # Populates input_ids and positions
+        for dp_rank in range(dp_size):
+            if num_req_per_dp_rank[dp_rank] == 0:
+                continue
+            token_offset = padded_num_scheduled_tokens_per_dp_rank * dp_rank
+            num_scheduled_tokens_per_req = scheduled_tokens_per_dp_rank[
+                dp_rank]
+            total_num_scheduled_tokens = num_scheduled_tokens_per_dp_rank[
+                dp_rank]
+            input_ids_cpu = input_ids_view[
+                token_offset:token_offset +
+                padded_num_scheduled_tokens_per_dp_rank]
+            positions_cpu = self.positions_cpu[
+                token_offset:token_offset +
+                padded_num_scheduled_tokens_per_dp_rank]
+            # Get request indices.
+            # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
+            # For each scheduled token, what are the corresponding req index.
+            req_indices = np.repeat(req_indices_dp[dp_rank],
+                                    num_scheduled_tokens_per_req)
+            # Get batched arange.
+            # E.g., [2, 5, 3] -> [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
+            # For each scheduled token, what is its position in corresponding req.
+            arange = np.concatenate(
+                [self.arange_cpu[:n] for n in num_scheduled_tokens_per_req])
+            # Get positions.
+            positions_np = positions_cpu[:total_num_scheduled_tokens]
+            np.add(
+                self.input_batch.num_computed_tokens_cpu[req_indices],
+                arange,
+                out=positions_np,
             )
-            query_start_loc_view = self.device_buffer.get_view(
-                (self.max_num_reqs + dp_size,), key="query_start_loc"
-            )
-            seq_lens_view = self.device_buffer.get_view(
-                (self.max_num_reqs,), key="seq_lens"
-            )
-
-            use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
-
-            if use_spec_decode:
-                num_draft_tokens = np.zeros(num_reqs, dtype=np.int32)
-                for (
-                    req_id,
-                    draft_token_ids,
-                ) in scheduler_output.scheduled_spec_decode_tokens.items():
-                    req_idx = self.input_batch.req_id_to_index[req_id]
-                    num_draft_tokens[req_idx] = len(draft_token_ids)
-
-                num_sampled_tokens = num_draft_tokens + 1
-                total_sampled_tokens = np.sum(num_sampled_tokens)
-                padded_logits_length = runner_utils.get_padded_token_len(
-                    self.num_logits_paddings, total_sampled_tokens
-                )
-                logits_indices_shape = (padded_logits_length,)
-            else:
-                logits_indices_shape = (padded_num_reqs,)
-
-            logits_indices_view = self.device_buffer.get_view(
-                logits_indices_shape, key="logits_indices"
+            # Get token indices.
+            # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
+            # -> [0, 1, M, M + 1, M + 2, M + 3, M + 4, 2 * M, 2 * M + 1, 2 * M + 2]
+            # where M is the max_model_len.
+            token_indices = (
+                positions_np +
+                req_indices * self.input_batch.token_ids_cpu.shape[1])
+            np.take(
+                self.input_batch.token_ids_cpu.ravel(),
+                token_indices,
+                out=input_ids_cpu[:total_num_scheduled_tokens],
             )
 
-            # Populates input_ids and positions
+            input_ids_cpu[total_num_scheduled_tokens:] = 0
+
+        # Prepare the attention metadata (query_start_loc_cpu, seq_lens_cpu)
+        for dp_rank in range(dp_size):
+            req_offset = dp_rank * max_num_reqs_per_dp_rank
+            query_start_loc_cpu = query_start_loc_view[
+                req_offset + dp_rank:req_offset + max_num_reqs_per_dp_rank +
+                dp_rank + 1]
+            seq_lens_cpu = seq_lens_view[req_offset:req_offset +
+                                         max_num_reqs_per_dp_rank]
+            _num_reqs = num_req_per_dp_rank[dp_rank]
+            req_indices = req_indices_dp[dp_rank]
+            num_scheduled_tokens_per_req = scheduled_tokens_per_dp_rank[
+                dp_rank]
+
+            if _num_reqs == 0:
+                query_start_loc_cpu[:] = 0
+                seq_lens_cpu[:] = 0
+                continue
+
+            # After buffer.reset(), the buffer is still dirty, so we need to zero
+            # Out the starting index.
+            query_start_loc_cpu[0] = 0
+            np.cumsum(
+                num_scheduled_tokens_per_req,
+                out=query_start_loc_cpu[1:_num_reqs + 1],
+            )
+            query_start_loc_cpu[_num_reqs + 1:] = 1
+
+            seq_lens_cpu[:_num_reqs] = (
+                self.input_batch.num_computed_tokens_cpu[req_indices] +
+                num_scheduled_tokens_per_req)
+            seq_lens_cpu[_num_reqs:] = 0
+
+        # populate logits_indices
+        for dp_rank in range(dp_size):
+            req_offset = dp_rank * padded_num_reqs_per_dp_rank
+            query_loc_req_offset = dp_rank * (max_num_reqs_per_dp_rank + 1)
+            _num_reqs = num_req_per_dp_rank[dp_rank]
+
+            logits_indices_cpu = logits_indices_view[
+                req_offset:req_offset + padded_num_reqs_per_dp_rank]
+            logits_indices_cpu[:_num_reqs] = (
+                query_start_loc_view[query_loc_req_offset +
+                                     1:query_loc_req_offset + _num_reqs + 1] -
+                1)
+            logits_indices_cpu[_num_reqs:] = -1
+
+        # Please see runner_utils.PhasedBasedProfiler for details
+        if self.phase_based_profiler:
+            self.batch_counter += 1
+            batch_composition_stats = runner_utils.get_batch_composition_stats(
+                self.batch_counter, self.input_batch,
+                total_num_scheduled_tokens, num_reqs,
+                padded_total_num_scheduled_tokens, scheduler_output)
+
+            self.phase_based_profiler.step(batch_composition_stats)
+
+        positions = self.positions_cpu[:padded_total_num_scheduled_tokens]
+        mrope_positions = self.mrope_positions_cpu[:, :
+                                                   padded_total_num_scheduled_tokens]
+        _request_distribution = []
+        for dp_rank in range(dp_size):
+            _num_reqs = num_req_per_dp_rank[dp_rank]
+            # The batch has been reordered by _reorder_batch so decode requests come first
+            # Count decode requests (those with num_scheduled_tokens == 1) in this DP rank
+            num_decode_in_dp_rank = 0
+            for req_id in req_ids_dp[dp_rank]:
+                if scheduler_output.num_scheduled_tokens[req_id] == 1:
+                    num_decode_in_dp_rank += 1
+            _request_distribution.append(
+                [num_decode_in_dp_rank, num_decode_in_dp_rank, _num_reqs])
+        request_distribution = np.array(_request_distribution,
+                                        dtype=np.int32).ravel()
+
+        use_spec_decode = len(
+            scheduler_output.scheduled_spec_decode_tokens) > 0
+        spec_decode_metadata = None
+        if use_spec_decode:
+            spec_decode_metadata = (
+                self.speculative_decoding_manager.get_spec_decode_metadata(
+                    num_draft_tokens,
+                    query_start_loc_view[1:num_reqs + 1],
+                    padded_num_reqs,
+                    input_ids_view,
+                ))
+            logits_indices_view[:] = spec_decode_metadata.final_logits_indices
+
+        # Put to device
+        sampling_metadata = TPUSupportedSamplingMetadata.from_input_batch(
+            self.mesh,
+            self.input_batch,
+            padded_num_reqs,
+            sharding=data_parallel_attn_sharding,
+        )
+
+        if self.uses_mrope:
+            # M-RoPE positions are of the shape (3, max_num_tokens).
+            # https://github.com/vllm-project/tpu-inference/blob/efc9608acd925bb3b64db6fda509514f799ab7be/tpu_inference/runner/tpu_runner.py#L555
+            # Shard the positions accordingly.
+            mrope_sharding = NamedSharding(
+                self.mesh, PartitionSpec(None, ShardingAxisName.ATTN_DATA))
+            positions = device_array(self.mesh,
+                                     mrope_positions,
+                                     sharding=mrope_sharding)
+        else:
+            positions = device_array(self.mesh,
+                                     positions,
+                                     sharding=data_parallel_attn_sharding)
+
+        # Collect block tables host arrays loops zone presence zones legality
+        def build_block_table_host(kv_cache_gid: int) -> None:
+
+            block_table_obj = self.input_batch.block_table[kv_cache_gid]
+            block_tables_view = self.device_buffer.get_view(
+                (self.max_num_reqs, block_table_obj.max_num_blocks_per_req),
+                key=f"block_tables_gid_{kv_cache_gid}")
+
+            # Zero out the view once for correct padding
+            block_tables_view.fill(0)
+
+            cpu_tensor = block_table_obj.get_cpu_tensor()
             for dp_rank in range(dp_size):
-                if num_req_per_dp_rank[dp_rank] == 0:
-                    continue
-                token_offset = padded_num_scheduled_tokens_per_dp_rank * dp_rank
-                num_scheduled_tokens_per_req = scheduled_tokens_per_dp_rank[dp_rank]
-                total_num_scheduled_tokens = num_scheduled_tokens_per_dp_rank[dp_rank]
-                input_ids_cpu = input_ids_view[
-                    token_offset : token_offset
-                    + padded_num_scheduled_tokens_per_dp_rank
-                ]
-                positions_cpu = self.positions_cpu[
-                    token_offset : token_offset
-                    + padded_num_scheduled_tokens_per_dp_rank
-                ]
-                # Get request indices.
-                # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
-                # For each scheduled token, what are the corresponding req index.
-                req_indices = np.repeat(
-                    req_indices_dp[dp_rank], num_scheduled_tokens_per_req
-                )
-                # Get batched arange.
-                # E.g., [2, 5, 3] -> [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
-                # For each scheduled token, what is its position in corresponding req.
-                arange = np.concatenate(
-                    [self.arange_cpu[:n] for n in num_scheduled_tokens_per_req]
-                )
-                # Get positions.
-                positions_np = positions_cpu[:total_num_scheduled_tokens]
-                np.add(
-                    self.input_batch.num_computed_tokens_cpu[req_indices],
-                    arange,
-                    out=positions_np,
-                )
-                # Get token indices.
-                # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
-                # -> [0, 1, M, M + 1, M + 2, M + 3, M + 4, 2 * M, 2 * M + 1, 2 * M + 2]
-                # where M is the max_model_len.
-                token_indices = (
-                    positions_np + req_indices * self.input_batch.token_ids_cpu.shape[1]
-                )
-                np.take(
-                    self.input_batch.token_ids_cpu.ravel(),
-                    token_indices,
-                    out=input_ids_cpu[:total_num_scheduled_tokens],
-                )
-
-                input_ids_cpu[total_num_scheduled_tokens:] = 0
-
-            # Prepare the attention metadata (query_start_loc_cpu, seq_lens_cpu)
-            for dp_rank in range(dp_size):
-                req_offset = dp_rank * max_num_reqs_per_dp_rank
-                query_start_loc_cpu = query_start_loc_view[
-                    req_offset
-                    + dp_rank : req_offset
-                    + max_num_reqs_per_dp_rank
-                    + dp_rank
-                    + 1
-                ]
-                seq_lens_cpu = seq_lens_view[
-                    req_offset : req_offset + max_num_reqs_per_dp_rank
-                ]
                 _num_reqs = num_req_per_dp_rank[dp_rank]
-                req_indices = req_indices_dp[dp_rank]
-                num_scheduled_tokens_per_req = scheduled_tokens_per_dp_rank[dp_rank]
-
                 if _num_reqs == 0:
-                    query_start_loc_cpu[:] = 0
-                    seq_lens_cpu[:] = 0
                     continue
 
-                # After buffer.reset(), the buffer is still dirty, so we need to zero
-                # Out the starting index.
-                query_start_loc_cpu[0] = 0
-                np.cumsum(
-                    num_scheduled_tokens_per_req,
-                    out=query_start_loc_cpu[1 : _num_reqs + 1],
-                )
-                query_start_loc_cpu[_num_reqs + 1 :] = 1
-
-                seq_lens_cpu[:_num_reqs] = (
-                    self.input_batch.num_computed_tokens_cpu[req_indices]
-                    + num_scheduled_tokens_per_req
-                )
-                seq_lens_cpu[_num_reqs:] = 0
-
-            # populate logits_indices
-            for dp_rank in range(dp_size):
-                req_offset = dp_rank * padded_num_reqs_per_dp_rank
-                query_loc_req_offset = dp_rank * (max_num_reqs_per_dp_rank + 1)
-                _num_reqs = num_req_per_dp_rank[dp_rank]
-
-                logits_indices_cpu = logits_indices_view[
-                    req_offset : req_offset + padded_num_reqs_per_dp_rank
-                ]
-                logits_indices_cpu[:_num_reqs] = (
-                    query_start_loc_view[
-                        query_loc_req_offset + 1 : query_loc_req_offset + _num_reqs + 1
-                    ]
-                    - 1
-                )
-                logits_indices_cpu[_num_reqs:] = -1
-
-            # Please see runner_utils.PhasedBasedProfiler for details
-            if self.phase_based_profiler:
-                self.batch_counter += 1
-                batch_composition_stats = runner_utils.get_batch_composition_stats(
-                    self.batch_counter,
-                    self.input_batch,
-                    total_num_scheduled_tokens,
-                    num_reqs,
-                    padded_total_num_scheduled_tokens,
-                    scheduler_output,
-                )
-
-                self.phase_based_profiler.step(batch_composition_stats)
-
-            positions = self.positions_cpu[:padded_total_num_scheduled_tokens]
-            mrope_positions = self.mrope_positions_cpu[
-                :, :padded_total_num_scheduled_tokens
-            ]
-            _request_distribution = []
-            for dp_rank in range(dp_size):
-                _num_reqs = num_req_per_dp_rank[dp_rank]
-                # The batch has been reordered by _reorder_batch so decode requests come first
-                # Count decode requests (those with num_scheduled_tokens == 1) in this DP rank
-                num_decode_in_dp_rank = 0
-                for req_id in req_ids_dp[dp_rank]:
-                    if scheduler_output.num_scheduled_tokens[req_id] == 1:
-                        num_decode_in_dp_rank += 1
-                _request_distribution.append(
-                    [num_decode_in_dp_rank, num_decode_in_dp_rank, _num_reqs]
-                )
-            request_distribution = np.array(
-                _request_distribution, dtype=np.int32
-            ).ravel()
-
-            use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
-            spec_decode_metadata = None
-            if use_spec_decode:
-                spec_decode_metadata = (
-                    self.speculative_decoding_manager.get_spec_decode_metadata(
-                        num_draft_tokens,
-                        query_start_loc_view[1 : num_reqs + 1],
-                        padded_num_reqs,
-                        input_ids_view,
-                    )
-                )
-                logits_indices_view[:] = spec_decode_metadata.final_logits_indices
-
-            # Put to device
-            sampling_metadata = TPUSupportedSamplingMetadata.from_input_batch(
-                self.mesh,
-                self.input_batch,
-                padded_num_reqs,
-                sharding=data_parallel_attn_sharding,
-            )
-
-            if self.uses_mrope:
-                # M-RoPE positions are of the shape (3, max_num_tokens).
-                # https://github.com/vllm-project/tpu-inference/blob/efc9608acd925bb3b64db6fda509514f799ab7be/tpu_inference/runner/tpu_runner.py#L555
-                # Shard the positions accordingly.
-                mrope_sharding = NamedSharding(
-                    self.mesh, PartitionSpec(None, ShardingAxisName.ATTN_DATA)
-                )
-                positions = device_array(
-                    self.mesh, mrope_positions, sharding=mrope_sharding
-                )
-            else:
-                positions = device_array(
-                    self.mesh, positions, sharding=data_parallel_attn_sharding
-                )
-
-            # Collect block tables host arrays loops zone presence zones legality
-            def build_block_table_host(kv_cache_gid: int) -> None:
-
-                block_table_obj = self.input_batch.block_table[kv_cache_gid]
-                block_tables_view = self.device_buffer.get_view(
-                    (self.max_num_reqs, block_table_obj.max_num_blocks_per_req),
-                    key=f"block_tables_gid_{kv_cache_gid}",
-                )
-
-                # Zero out the view once for correct padding
-                block_tables_view.fill(0)
-
-                cpu_tensor = block_table_obj.get_cpu_tensor()
-                for dp_rank in range(dp_size):
-                    _num_reqs = num_req_per_dp_rank[dp_rank]
-                    if _num_reqs == 0:
-                        continue
-
-                    req_offset = dp_rank * max_num_reqs_per_dp_rank
-                    # Use np.take with out= to avoid intermediate copies from advanced indexing
-                    np.take(
-                        cpu_tensor,
+                req_offset = dp_rank * max_num_reqs_per_dp_rank
+                # Use np.take with out= to avoid intermediate copies from advanced indexing
+                np.take(cpu_tensor,
                         req_indices_dp[dp_rank],
                         axis=0,
-                        out=block_tables_view[req_offset : req_offset + _num_reqs],
-                    )
+                        out=block_tables_view[req_offset:req_offset +
+                                              _num_reqs])
 
-            if len(self.kv_cache_config.kv_cache_groups) <= 1:
-                no_kv_cache = len(self.kv_cache_config.kv_cache_groups) == 0
-                if not no_kv_cache:
-                    build_block_table_host(0)
-            else:
+        if len(self.kv_cache_config.kv_cache_groups) <= 1:
+            no_kv_cache = len(self.kv_cache_config.kv_cache_groups) == 0
+            if not no_kv_cache:
+                build_block_table_host(0)
+        else:
+            for gid, kv_cache_group in enumerate(
+                    self.kv_cache_config.kv_cache_groups):
+                build_block_table_host(gid)
+
+        metadata_blob, metadata_layout = self.device_buffer.build()
+
+        # Mamba slot ids are only consumed by hybrid attn+mamba models; for
+        # pure-attention models, leaving the field None keeps AttentionMetadata
+        # byte-identical to the pre-compact-mamba layout (so the model_fn
+        # signature on those models is unchanged).
+        if self.kv_cache_config.has_mamba_layers:
+            # Reorder mamba_state_indices per DP rank (like block_tables)
+            # and convert global slot ids to rank-local indices so they
+            # index correctly into the per-rank shard of the mamba state.
+            local_slots = self.input_batch._mamba_local_slots
+            mamba_state_indices_cpu = np.zeros(self.max_num_reqs,
+                                               dtype=np.int32)
+            for dp_rank in range(dp_size):
+                _num_reqs = num_req_per_dp_rank[dp_rank]
+                if _num_reqs == 0:
+                    continue
+                req_offset = dp_rank * max_num_reqs_per_dp_rank
+                global_slots = self.input_batch.mamba_state_indices_cpu[
+                    req_indices_dp[dp_rank]]
+                mamba_state_indices_cpu[req_offset:req_offset +
+                                        _num_reqs] = (global_slots %
+                                                      local_slots)
+            (request_distribution, mamba_state_indices,
+             dev_arrays_payload) = device_array(
+                 self.mesh, (request_distribution, mamba_state_indices_cpu,
+                             metadata_blob),
+                 sharding=data_parallel_attn_sharding)
+        else:
+            mamba_state_indices = None
+            (request_distribution, dev_arrays_payload) = device_array(
+                self.mesh, (request_distribution, metadata_blob),
+                sharding=data_parallel_attn_sharding)
+
+        metadata = common_utils.DeviceBuffer.unpack_arrays(
+            dev_arrays_payload, metadata_layout)
+        input_ids = metadata["input_ids"]
+        query_start_loc = metadata["query_start_loc"]
+        seq_lens = metadata["seq_lens"]
+        logits_indices = metadata["logits_indices"]
+
+        # The host-side `num_computed_tokens_cpu` assumes all speculatively
+        # proposed tokens from the previous step were accepted. Subtract the
+        # actual rejection counts from `seq_lens` and `positions` on TPU.
+        if self.speculative_config and self.scheduler_config.async_scheduling and self._pre_async_results is not None:
+            seq_lens, positions = self._subtract_num_rejected_tokens(
+                seq_lens, positions, scheduled_tokens_per_dp_rank[0])
+
+        def build_attn(block_tables: jax.Array | None) -> AttentionMetadata:
+            attention_metadata_gid = AttentionMetadata(
+                input_positions=positions,
+                block_tables=block_tables,
+                seq_lens=seq_lens,
+                query_start_loc=query_start_loc,
+                request_distribution=request_distribution,
+                mamba_state_indices=mamba_state_indices,
+                padded_num_reqs=attn_padded_num_reqs,
+            )
+
+            # This is for making these cpu buffers hidden during tracing
+            attention_metadata_gid.query_start_loc_cpu = query_start_loc_view
+            return attention_metadata_gid
+
+        attention_metadata: AttentionMetadata | dict[str, AttentionMetadata]
+        if len(self.kv_cache_config.kv_cache_groups) <= 1:
+            # Pooling model will not using kv cache
+            no_kv_cache = len(self.kv_cache_config.kv_cache_groups) == 0
+            block_tables = metadata.get(
+                "block_tables_gid_0") if not no_kv_cache else None
+            attention_metadata = build_attn(block_tables)
+        else:
+            attention_metadata = {
+                name: build_attn(metadata[f"block_tables_gid_{gid}"])
                 for gid, kv_cache_group in enumerate(
-                    self.kv_cache_config.kv_cache_groups
-                ):
-                    build_block_table_host(gid)
+                    self.kv_cache_config.kv_cache_groups)
+                for name in kv_cache_group.layer_names
+            }
 
-            metadata_blob, metadata_layout = self.device_buffer.build()
+        # Async scheduling: substitute placeholder tokens for DP
+        if self.scheduler_config.async_scheduling and self._pre_async_results is not None:
+            # Collect all token indices that need substitution across all DP ranks
+            all_token_indices_to_substitute = []
+            all_pre_next_tokens_indices = []
+            draft_all_token_indices_to_substitute = []
+            draft_all_pre_next_tokens_indices = []
 
-            # Mamba slot ids are only consumed by hybrid attn+mamba models; for
-            # pure-attention models, leaving the field None keeps AttentionMetadata
-            # byte-identical to the pre-compact-mamba layout (so the model_fn
-            # signature on those models is unchanged).
-            if self.kv_cache_config.has_mamba_layers:
-                # Reorder mamba_state_indices per DP rank (like block_tables)
-                # and convert global slot ids to rank-local indices so they
-                # index correctly into the per-rank shard of the mamba state.
-                local_slots = self.input_batch._mamba_local_slots
-                mamba_state_indices_cpu = np.zeros(self.max_num_reqs, dtype=np.int32)
-                for dp_rank in range(dp_size):
-                    _num_reqs = num_req_per_dp_rank[dp_rank]
-                    if _num_reqs == 0:
-                        continue
-                    req_offset = dp_rank * max_num_reqs_per_dp_rank
-                    global_slots = self.input_batch.mamba_state_indices_cpu[
-                        req_indices_dp[dp_rank]
-                    ]
-                    mamba_state_indices_cpu[req_offset : req_offset + _num_reqs] = (
-                        global_slots % local_slots
-                    )
-                (request_distribution, mamba_state_indices, dev_arrays_payload) = (
-                    device_array(
-                        self.mesh,
-                        (request_distribution, mamba_state_indices_cpu, metadata_blob),
-                        sharding=data_parallel_attn_sharding,
-                    )
-                )
-            else:
-                mamba_state_indices = None
-                (request_distribution, dev_arrays_payload) = device_array(
-                    self.mesh,
-                    (request_distribution, metadata_blob),
-                    sharding=data_parallel_attn_sharding,
-                )
+            for dp_rank in range(dp_size):
+                cur_indices = token_in_tpu_cur_input_indices_dp[dp_rank]
+                pre_indices = token_in_tpu_pre_next_tokens_indices_dp[dp_rank]
+                all_token_indices_to_substitute.extend(cur_indices)
+                all_pre_next_tokens_indices.extend(pre_indices)
+                draft_all_token_indices_to_substitute.extend(
+                    draft_token_in_tpu_cur_indices_dp[dp_rank])
+                draft_all_pre_next_tokens_indices.extend(
+                    draft_token_in_prev_next_tokens_indices_dp[dp_rank])
 
-            metadata = common_utils.DeviceBuffer.unpack_arrays(
-                dev_arrays_payload, metadata_layout
+            if self.scheduler_config.async_scheduling and self._pre_async_results:
+                if self.speculative_config:
+                    next_tokens = self._pre_async_results.spec_decode_next_tokens
+                else:
+                    next_tokens = self._pre_async_results.next_tokens
+                token_in_tpu_cur_input_indices = np.array(
+                    all_token_indices_to_substitute)
+                token_in_tpu_pre_next_tokens_indices = np.array(
+                    all_pre_next_tokens_indices)
+                input_ids = self._apply_async_token_substitution(
+                    input_ids, next_tokens, token_in_tpu_cur_input_indices,
+                    token_in_tpu_pre_next_tokens_indices)
+                if spec_decode_metadata:
+                    draft_token_in_tpu_cur_input_indices = np.array(
+                        draft_all_token_indices_to_substitute)
+                    draft_token_in_tpu_pre_next_tokens_indices = np.array(
+                        draft_all_pre_next_tokens_indices)
+                    draft_token_ids = self._apply_async_token_substitution(
+                        spec_decode_metadata.draft_token_ids,
+                        self._pre_async_results.spec_decode_next_tokens,
+                        draft_token_in_tpu_cur_input_indices,
+                        draft_token_in_tpu_pre_next_tokens_indices)
+                    new_md = replace(spec_decode_metadata,
+                                     draft_token_ids=draft_token_ids)
+                    new_md.draft_lengths_cpu = spec_decode_metadata.draft_lengths_cpu
+                    spec_decode_metadata = new_md
+
+        num_scheduled_tokens_per_req = np.concatenate([
+            np.array(scheduled_tokens_per_dp_rank[dp_rank], dtype=np.int32)
+            for dp_rank in range(dp_size)
+        ])
+        if self.lora_config is not None:
+            self.lora_utils.set_active_loras(
+                num_scheduled_tokens_per_req,
+                total_num_scheduled_tokens,
+                padded_total_num_scheduled_tokens,
             )
-            input_ids = metadata["input_ids"]
-            query_start_loc = metadata["query_start_loc"]
-            seq_lens = metadata["seq_lens"]
-            logits_indices = metadata["logits_indices"]
 
-            # The host-side `num_computed_tokens_cpu` assumes all speculatively
-            # proposed tokens from the previous step were accepted. Subtract the
-            # actual rejection counts from `seq_lens` and `positions` on TPU.
-            if (
-                self.speculative_config
-                and self.scheduler_config.async_scheduling
-                and self._pre_async_results is not None
-            ):
-                seq_lens, positions = self._subtract_num_rejected_tokens(
-                    seq_lens, positions, scheduled_tokens_per_dp_rank[0]
-                )
-
-            def build_attn(block_tables: jax.Array | None) -> AttentionMetadata:
-                attention_metadata_gid = AttentionMetadata(
-                    input_positions=positions,
-                    block_tables=block_tables,
-                    seq_lens=seq_lens,
-                    query_start_loc=query_start_loc,
-                    request_distribution=request_distribution,
-                    mamba_state_indices=mamba_state_indices,
-                    padded_num_reqs=attn_padded_num_reqs,
-                )
-
-                # This is for making these cpu buffers hidden during tracing
-                attention_metadata_gid.query_start_loc_cpu = query_start_loc_view
-                return attention_metadata_gid
-
-            attention_metadata: AttentionMetadata | dict[str, AttentionMetadata]
-            if len(self.kv_cache_config.kv_cache_groups) <= 1:
-                # Pooling model will not using kv cache
-                no_kv_cache = len(self.kv_cache_config.kv_cache_groups) == 0
-                block_tables = (
-                    metadata.get("block_tables_gid_0") if not no_kv_cache else None
-                )
-                attention_metadata = build_attn(block_tables)
-            else:
-                attention_metadata = {
-                    name: build_attn(metadata[f"block_tables_gid_{gid}"])
-                    for gid, kv_cache_group in enumerate(
-                        self.kv_cache_config.kv_cache_groups
-                    )
-                    for name in kv_cache_group.layer_names
-                }
-
-            # Async scheduling: substitute placeholder tokens for DP
-            if (
-                self.scheduler_config.async_scheduling
-                and self._pre_async_results is not None
-            ):
-                # Collect all token indices that need substitution across all DP ranks
-                all_token_indices_to_substitute = []
-                all_pre_next_tokens_indices = []
-                draft_all_token_indices_to_substitute = []
-                draft_all_pre_next_tokens_indices = []
-
-                for dp_rank in range(dp_size):
-                    cur_indices = token_in_tpu_cur_input_indices_dp[dp_rank]
-                    pre_indices = token_in_tpu_pre_next_tokens_indices_dp[dp_rank]
-                    all_token_indices_to_substitute.extend(cur_indices)
-                    all_pre_next_tokens_indices.extend(pre_indices)
-                    draft_all_token_indices_to_substitute.extend(
-                        draft_token_in_tpu_cur_indices_dp[dp_rank]
-                    )
-                    draft_all_pre_next_tokens_indices.extend(
-                        draft_token_in_prev_next_tokens_indices_dp[dp_rank]
-                    )
-
-                if self.scheduler_config.async_scheduling and self._pre_async_results:
-                    if self.speculative_config:
-                        next_tokens = self._pre_async_results.spec_decode_next_tokens
-                    else:
-                        next_tokens = self._pre_async_results.next_tokens
-                    token_in_tpu_cur_input_indices = np.array(
-                        all_token_indices_to_substitute
-                    )
-                    token_in_tpu_pre_next_tokens_indices = np.array(
-                        all_pre_next_tokens_indices
-                    )
-                    input_ids = self._apply_async_token_substitution(
-                        input_ids,
-                        next_tokens,
-                        token_in_tpu_cur_input_indices,
-                        token_in_tpu_pre_next_tokens_indices,
-                    )
-                    if spec_decode_metadata:
-                        draft_token_in_tpu_cur_input_indices = np.array(
-                            draft_all_token_indices_to_substitute
-                        )
-                        draft_token_in_tpu_pre_next_tokens_indices = np.array(
-                            draft_all_pre_next_tokens_indices
-                        )
-                        draft_token_ids = self._apply_async_token_substitution(
-                            spec_decode_metadata.draft_token_ids,
-                            self._pre_async_results.spec_decode_next_tokens,
-                            draft_token_in_tpu_cur_input_indices,
-                            draft_token_in_tpu_pre_next_tokens_indices,
-                        )
-                        new_md = replace(
-                            spec_decode_metadata, draft_token_ids=draft_token_ids
-                        )
-                        new_md.draft_lengths_cpu = (
-                            spec_decode_metadata.draft_lengths_cpu
-                        )
-                        spec_decode_metadata = new_md
-
-            num_scheduled_tokens_per_req = np.concatenate(
-                [
-                    np.array(scheduled_tokens_per_dp_rank[dp_rank], dtype=np.int32)
-                    for dp_rank in range(dp_size)
-                ]
-            )
-            if self.lora_config is not None:
-                self.lora_utils.set_active_loras(
-                    num_scheduled_tokens_per_req,
-                    total_num_scheduled_tokens,
-                    padded_total_num_scheduled_tokens,
-                )
-
-            return (
-                input_ids,
-                positions,
-                attention_metadata,
-                sampling_metadata,
-                logits_indices,
-                spec_decode_metadata,
-                logits_indices_selector,
-                padded_num_reqs,
-                req_ids_dp,
-                padded_num_scheduled_tokens_per_dp_rank,
-            )
+        return (
+            input_ids,
+            positions,
+            attention_metadata,
+            sampling_metadata,
+            logits_indices,
+            spec_decode_metadata,
+            logits_indices_selector,
+            padded_num_reqs,
+            req_ids_dp,
+            padded_num_scheduled_tokens_per_dp_rank,
+        )
 
     def _get_input_ids_embeds(self, input_ids: jax.Array,
                               mm_embeds: list[jax.Array] | None,
