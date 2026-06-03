@@ -113,7 +113,15 @@ class LazyShardingAxisName:
             from vllm.config import get_current_vllm_config
             try:
                 vllm_config = get_current_vllm_config()
-            except Exception:
+            except AssertionError:
+                vllm_config = None
+            except Exception as e:
+                logger.warning(
+                    "Unexpected error getting vLLM config: %s. Please Note "
+                    "configuration issues might be ignored, falling back to "
+                    "default sharding axis.",
+                    e,
+                )
                 vllm_config = None
 
             enable_dp_attention = False
@@ -370,7 +378,7 @@ class ShardingConfigManager:
                 f"device_indexes={self.device_indexes})")
 
 
-#TODO split this into block unique sharding config, i.e. attentionShardingConfig, MoEShardingConfig
+# TODO split this into block unique sharding config, i.e. attentionShardingConfig, MoEShardingConfig
 @dataclass
 class ShardingRulesConfig:
     """Holds detailed sharding configurations for individual tensors, namely logical rules.

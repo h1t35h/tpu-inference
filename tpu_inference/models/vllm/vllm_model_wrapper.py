@@ -488,7 +488,7 @@ class VllmModelWrapper:
         if not self.vllm_config.model_config.is_multimodal_model:
             return None
 
-        @jax.jit
+        # The function cannot be JITted directly due to its dynamic implementation
         def embed_input_ids_func(
             params_and_buffers: Any,
             input_ids: jax.Array,

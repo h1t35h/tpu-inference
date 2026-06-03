@@ -280,7 +280,7 @@ def _jax_compatible_merge_multimodal_embeddings(
 
     return new_embeds
 
-
+# Translated from https://github.com/vllm-project/vllm/blob/7b476c8f14f1774373ec4e8581b2f3147580f3c2/vllm/model_executor/models/qwen3_vl.py#L278
 @partial(jax.jit, static_argnums=(1, 2, 3, 4, 5))
 def pos_embed_interpolate_jax(
     embed_weight: jax.Array,

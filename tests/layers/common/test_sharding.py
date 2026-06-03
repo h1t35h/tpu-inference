@@ -365,6 +365,61 @@ class TestLazyShardingAxisName(unittest.TestCase):
             _ = lazy.SEQUENCE  # initialized here, after env changed
             self.assertIs(lazy._cls, ShardingAxisNameBase)
 
+    @patch("tpu_inference.layers.common.sharding.envs.USE_2D_TP", True)
+    @patch("tpu_inference.layers.common.sharding.envs.NEW_MODEL_DESIGN", False)
+    def test_kv_cache_head_assertion_error_fallback(self):
+        # When get_current_vllm_config raises AssertionError, it should fallback to MODEL axis
+        lazy = LazyShardingAxisName()
+        with patch("vllm.config.get_current_vllm_config", side_effect=AssertionError("Config not set")):
+            val = lazy.KV_CACHE_HEAD
+            self.assertEqual(val, "model")
+
+    @patch("tpu_inference.layers.common.sharding.envs.USE_2D_TP", True)
+    @patch("tpu_inference.layers.common.sharding.envs.NEW_MODEL_DESIGN", False)
+    @patch("tpu_inference.layers.common.sharding.logger.warning")
+    def test_kv_cache_head_other_exception_fallback(self, mock_warning):
+        # When get_current_vllm_config raises another exception, it should log a warning and fallback to MODEL axis
+        lazy = LazyShardingAxisName()
+        with patch("vllm.config.get_current_vllm_config", side_effect=ValueError("Unexpected config error")):
+            val = lazy.KV_CACHE_HEAD
+            self.assertEqual(val, "model")
+            mock_warning.assert_called_once()
+            self.assertIn("Unexpected error getting vLLM config", mock_warning.call_args[0][0])
+
+    @patch("tpu_inference.layers.common.sharding.envs.USE_2D_TP", True)
+    @patch("tpu_inference.layers.common.sharding.envs.NEW_MODEL_DESIGN", False)
+    def test_kv_cache_head_enable_dp_attention(self):
+        # When get_current_vllm_config returns config with enable_dp_attention=True, it should return Base's KV_CACHE_HEAD
+        lazy = LazyShardingAxisName()
+        vllm_config = MagicMock()
+        vllm_config.additional_config = {
+            "sharding": {
+                "sharding_strategy": {
+                    "enable_dp_attention": True
+                }
+            }
+        }
+        with patch("vllm.config.get_current_vllm_config", return_value=vllm_config):
+            val = lazy.KV_CACHE_HEAD
+            self.assertEqual(val, ("model", "expert"))
+
+    @patch("tpu_inference.layers.common.sharding.envs.USE_2D_TP", True)
+    @patch("tpu_inference.layers.common.sharding.envs.NEW_MODEL_DESIGN", False)
+    def test_kv_cache_head_disable_dp_attention(self):
+        # When get_current_vllm_config returns config with enable_dp_attention=False, it should return Base's MODEL
+        lazy = LazyShardingAxisName()
+        vllm_config = MagicMock()
+        vllm_config.additional_config = {
+            "sharding": {
+                "sharding_strategy": {
+                    "enable_dp_attention": False
+                }
+            }
+        }
+        with patch("vllm.config.get_current_vllm_config", return_value=vllm_config):
+            val = lazy.KV_CACHE_HEAD
+            self.assertEqual(val, "model")
+
 
 if __name__ == "__main__":
     unittest.main()
