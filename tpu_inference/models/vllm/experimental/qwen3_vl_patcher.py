@@ -331,7 +331,7 @@ def pos_embed_interpolate_jax(
     return repeated
 
 
-@partial(jax.jit, static_argnums=(1, 2))
+@partial(jax.jit, static_argnums=(0, 1, 2))
 def rot_pos_ids_jax(h: int, w: int, spatial_merge_size: int) -> jax.Array:
     h_div = h // spatial_merge_size
     w_div = w // spatial_merge_size
@@ -347,7 +347,7 @@ def rot_pos_ids_jax(h: int, w: int, spatial_merge_size: int) -> jax.Array:
     return jnp.stack([hpos_ids, wpos_ids], axis=-1)
 
 
-@partial(jax.jit, static_argnums=(3, 4))
+@partial(jax.jit, static_argnums=(2, 3, 4))
 def rot_pos_emb_jax(
     cos_cache: jax.Array,
     sin_cache: jax.Array,
