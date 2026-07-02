@@ -15,9 +15,10 @@ from jax.experimental.pallas import tpu as pltpu
 from jax import shard_map
 from jax.sharding import PartitionSpec as P
 
-def inner_compute_a(x_sram, x_dtype, wg_tile, wu_tile, a_tile):
-    wg_sram = wg_tile[...].astype(x_dtype)
-    wu_sram = wu_tile[...].astype(x_dtype)
+def inner_compute_a(x_scratch, wg_tile, wu_tile, a_tile):
+    x_sram = x_scratch[...]
+    wg_sram = wg_tile[...].astype(x_sram.dtype)
+    wu_sram = wu_tile[...].astype(x_sram.dtype)
     wgu_sram = jnp.concatenate([wg_sram, wu_sram], axis=1)
     gu_sram = jnp.matmul(x_sram, wgu_sram, preferred_element_type=jnp.float32)
     h_sram, u_sram = jnp.split(gu_sram, 2, axis=-1)
@@ -25,14 +26,15 @@ def inner_compute_a(x_sram, x_dtype, wg_tile, wu_tile, a_tile):
     a_tile[...] = a_sram_out.astype(a_tile.dtype)
 
 
-def inner_compute_y(a_full_sram, x_dtype, wd_tile, y_tile):
-    wd_sram = wd_tile[...].astype(x_dtype)
-    y_sram = jnp.matmul(a_full_sram, wd_sram, preferred_element_type=jnp.float32)
+def inner_compute_y(a_scratch, wd_tile, y_tile):
+    a_sram = a_scratch[...]
+    wd_sram = wd_tile[...].astype(a_sram.dtype)
+    y_sram = jnp.matmul(a_sram, wd_sram, preferred_element_type=jnp.float32)
     y_tile[...] = y_sram.astype(y_tile.dtype)
 
 
 def mlp_kernel_main(
-    x_hbm, wg_hbm, wu_hbm, wd_hbm, y_hbm, a_scratch, *, b_seq, b_inter, b_hidden, hidden_size
+    x_hbm, wg_hbm, wu_hbm, wd_hbm, y_hbm, x_scratch, a_scratch, *, b_seq, b_inter, b_hidden, hidden_size
 ):
     """Entry point for Pallas grid. Wires up HBM references to the pipeline."""
     seq_idx = pl.program_id(0)
@@ -40,9 +42,17 @@ def mlp_kernel_main(
     num_inter = F_loc // b_inter
     num_hidden = hidden_size // b_hidden
 
-    # 1. Load x ONCE into SRAM
-    x_sram = x_hbm[pl.dslice(seq_idx * b_seq, b_seq), :]
-    x_dtype = x_sram.dtype
+    # 1. Pipeline to load x from HBM into VMEM
+    def load_x(x_tile, x_scratch_tile):
+        x_scratch_tile[...] = x_tile[...]
+        
+    pl_load_x = pltpu.emit_pipeline(
+        load_x,
+        grid=(1,),
+        in_specs=(pl.BlockSpec((b_seq, hidden_size), lambda j: (seq_idx, 0)),),
+        out_specs=(pl.BlockSpec((b_seq, hidden_size), lambda j: (0, 0), memory_space=pltpu.VMEM),),
+    )
+    pl_load_x(x_hbm, x_scratch)
 
     # 2. Block specs for Pipeline A
     wg_spec = pl.BlockSpec(
@@ -59,17 +69,14 @@ def mlp_kernel_main(
 
     # 3. Emit Pipeline A (computes 'a' into VMEM)
     pipeline_a = pltpu.emit_pipeline(
-        functools.partial(inner_compute_a, x_sram, x_dtype),
+        functools.partial(inner_compute_a, x_scratch),
         grid=(num_inter,),
         in_specs=(wg_spec, wu_spec),
         out_specs=a_spec,
     )
     pipeline_a(wg_hbm, wu_hbm, a_scratch)
 
-    # 4. Load a ONCE into SRAM (from VMEM)
-    a_full_sram = a_scratch[...]
-
-    # 5. Block specs for Pipeline Y
+    # 4. Block specs for Pipeline Y
     wd_spec = pl.BlockSpec(
         (F_loc, b_hidden),
         lambda j: (0, j),
@@ -77,9 +84,9 @@ def mlp_kernel_main(
     )
     y_spec = pl.BlockSpec((b_seq, b_hidden), lambda j: (seq_idx, j))
 
-    # 6. Emit Pipeline Y (computes 'y' into HBM)
+    # 5. Emit Pipeline Y (computes 'y' into HBM)
     pipeline_y = pltpu.emit_pipeline(
-        functools.partial(inner_compute_y, a_full_sram, x_dtype),
+        functools.partial(inner_compute_y, a_scratch),
         grid=(num_hidden,),
         in_specs=(wd_spec,),
         out_specs=y_spec,
