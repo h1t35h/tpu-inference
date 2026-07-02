@@ -50,9 +50,6 @@ def inner_compute_y(a_scratch, wd_tile, y_tile):
     acc_init = jnp.zeros((b_seq, b_hidden), dtype=jnp.float32)
     y_sram = jax.lax.fori_loop(0, F_loc // block_k, loop_body, acc_init)
     
-    # Overlap compute and communication by reducing the block immediately
-    y_sram = jax.lax.psum(y_sram, axis_name="model")
-    
     y_tile[...] = y_sram.astype(y_tile.dtype)
 
 
@@ -176,7 +173,7 @@ def apply_fused_mlp_sharded(
             compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
         )(x_loc, wg_loc, wu_loc, wd_loc)
 
-        return y_loc
+        return jax.lax.psum(y_loc, axis_name="model")
 
     return local_fused_mlp(x, wg, wu, wd)
 
