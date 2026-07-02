@@ -12,7 +12,7 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
-from jax.experimental.shard_map import shard_map
+from jax import shard_map
 from jax.sharding import PartitionSpec as P
 
 def inner_mlp_kernel(
@@ -142,10 +142,7 @@ def apply_fused_mlp_sharded(
     out_specs = P(None, None)
 
     @functools.partial(
-        shard_map,
-        mesh=mesh,
-        in_specs=in_specs,
-        out_specs=out_specs,
+        shard_map, mesh=mesh, in_specs=in_specs, out_specs=out_specs, check_vma=False
     )
     def local_fused_mlp(x_loc, wg_loc, wu_loc, wd_loc):
         seq_len, hidden_size = x_loc.shape
