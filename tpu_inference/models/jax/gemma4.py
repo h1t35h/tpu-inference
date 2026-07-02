@@ -47,6 +47,8 @@ from tpu_inference.models.jax.jax_intermediate_tensor import \
 from tpu_inference.models.jax.utils.weight_utils import (
     LoadableWithIterator, StandardWeightLoader,
     load_nnx_param_from_reshaped_torch)
+from tpu_inference.utils import get_mesh_shape_product
+from tpu_inference.layers.common.utils import slice_sharded_tensor_for_concatenation
 from tpu_inference.kernels.fused_mlp.v1.fused_mlp import apply_fused_mlp_with_padding
 
 logger = init_logger(__name__)
@@ -104,7 +106,12 @@ class Gemma4MLP(JaxModule):
 
     def __call__(self, x: jax.Array) -> jax.Array:
         if self.use_fused_kernel:
-            wg, wu = jnp.split(self.gate_up_proj.weight.get_value(), 2, axis=-1)
+            n_shards = get_mesh_shape_product(self.mesh, "model")
+            wg, wu = slice_sharded_tensor_for_concatenation(
+                self.gate_up_proj.weight.get_value(),
+                self.gate_up_proj.output_sizes,
+                n_shards
+            )
             wd = self.down_proj.weight.get_value()
             return apply_fused_mlp_with_padding(
                 x, wg, wu, wd, self.mesh, b_seq=256, b_inter=128
