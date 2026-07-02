@@ -107,7 +107,7 @@ class Gemma4MLP(JaxModule):
             wg, wu = jnp.split(self.gate_up_proj.weight.get_value(), 2, axis=-1)
             wd = self.down_proj.weight.get_value()
             return apply_fused_mlp_with_padding(
-                x, wg, wu, wd, self.mesh, b_seq=512, b_inter=256
+                x, wg, wu, wd, self.mesh, b_seq=256, b_inter=128
             )
 
         gate_up = self.gate_up_proj(x)
