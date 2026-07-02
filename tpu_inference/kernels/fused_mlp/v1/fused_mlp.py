@@ -41,7 +41,7 @@ def mlp_kernel_main(
     num_hidden = hidden_size // b_hidden
 
     # 1. Load x ONCE into SRAM
-    x_sram = pl.load(x_hbm, (pl.dslice(seq_idx * b_seq, b_seq), pl.dslice(0, hidden_size)))
+    x_sram = x_hbm[pl.dslice(seq_idx * b_seq, b_seq), :]
     x_dtype = x_sram.dtype
 
     # 2. Block specs for Pipeline A
@@ -67,7 +67,7 @@ def mlp_kernel_main(
     pipeline_a(wg_hbm, wu_hbm, a_scratch)
 
     # 4. Load a ONCE into SRAM (from VMEM)
-    a_full_sram = pl.load(a_scratch, (pl.dslice(0, b_seq), pl.dslice(0, F_loc)))
+    a_full_sram = a_scratch[...]
 
     # 5. Block specs for Pipeline Y
     wd_spec = pl.BlockSpec(
