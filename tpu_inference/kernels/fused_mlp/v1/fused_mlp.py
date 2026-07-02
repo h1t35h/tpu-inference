@@ -16,20 +16,11 @@ from jax import shard_map
 from jax.sharding import PartitionSpec as P
 
 def inner_compute_a(x_scratch, wg_tile, wu_tile, a_tile):
-    b_seq = x_scratch.shape[0]
-    hidden_size = x_scratch.shape[1]
-    b_inter = wg_tile.shape[1]
-    block_k = 128
+    wg_block = wg_tile[...].astype(x_scratch.dtype)
+    wu_block = wu_tile[...].astype(x_scratch.dtype)
+    wgu_block = jnp.concatenate([wg_block, wu_block], axis=1)
     
-    def loop_body(k, acc):
-        x_block = x_scratch[pl.dslice(0, b_seq), pl.dslice(k * block_k, block_k)]
-        wg_block = wg_tile[pl.dslice(k * block_k, block_k), pl.dslice(0, b_inter)].astype(x_block.dtype)
-        wu_block = wu_tile[pl.dslice(k * block_k, block_k), pl.dslice(0, b_inter)].astype(x_block.dtype)
-        wgu_block = jnp.concatenate([wg_block, wu_block], axis=1)
-        return acc + jnp.matmul(x_block, wgu_block, preferred_element_type=jnp.float32)
-        
-    acc_init = jnp.zeros((b_seq, 2 * b_inter), dtype=jnp.float32)
-    gu_sram = jax.lax.fori_loop(0, hidden_size // block_k, loop_body, acc_init)
+    gu_sram = jnp.matmul(x_scratch, wgu_block, preferred_element_type=jnp.float32)
     
     h_sram, u_sram = jnp.split(gu_sram, 2, axis=-1)
     a_sram_out = jax.nn.gelu(h_sram, approximate=True) * u_sram
@@ -37,19 +28,8 @@ def inner_compute_a(x_scratch, wg_tile, wu_tile, a_tile):
 
 
 def inner_compute_y(a_scratch, wd_tile, y_tile):
-    b_seq = a_scratch.shape[0]
-    F_loc = a_scratch.shape[1]
-    b_hidden = wd_tile.shape[1]
-    block_k = 128
-    
-    def loop_body(k, acc):
-        a_block = a_scratch[pl.dslice(0, b_seq), pl.dslice(k * block_k, block_k)]
-        wd_block = wd_tile[pl.dslice(k * block_k, block_k), pl.dslice(0, b_hidden)].astype(a_block.dtype)
-        return acc + jnp.matmul(a_block, wd_block, preferred_element_type=jnp.float32)
-        
-    acc_init = jnp.zeros((b_seq, b_hidden), dtype=jnp.float32)
-    y_sram = jax.lax.fori_loop(0, F_loc // block_k, loop_body, acc_init)
-    
+    wd_block = wd_tile[...].astype(a_scratch.dtype)
+    y_sram = jnp.matmul(a_scratch, wd_block, preferred_element_type=jnp.float32)
     y_tile[...] = y_sram.astype(y_tile.dtype)
 
 
