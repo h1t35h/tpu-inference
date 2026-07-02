@@ -33,8 +33,9 @@ def inner_mlp_kernel(
         wu_sram = wu_tile[...].astype(x_tile.dtype)
 
         # 2. Matmul 1 (x @ W_in)
-        h_sram = jnp.matmul(x_tile[...], wg_sram, preferred_element_type=jnp.float32)
-        u_sram = jnp.matmul(x_tile[...], wu_sram, preferred_element_type=jnp.float32)
+        wgu_sram = jnp.concatenate([wg_sram, wu_sram], axis=1)
+        gu_sram = jnp.matmul(x_tile[...], wgu_sram, preferred_element_type=jnp.float32)
+        h_sram, u_sram = jnp.split(gu_sram, 2, axis=-1)
 
         # Activate
         a_tile = jax.nn.gelu(h_sram, approximate=True) * u_sram
