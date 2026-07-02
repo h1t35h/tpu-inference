@@ -104,7 +104,7 @@ class Gemma4MLP(JaxModule):
 
     def __call__(self, x: jax.Array) -> jax.Array:
         if self.use_fused_kernel:
-            wg, wu = jnp.split(self.gate_up_proj.weight.get_value, 2, axis=-1)
+            wg, wu = jnp.split(self.gate_up_proj.weight.get_value(), 2, axis=-1)
             wd = self.down_proj.weight.get_value()
             return apply_fused_mlp_with_padding(
                 x, wg, wu, wd, self.mesh, b_seq=512, b_inter=256

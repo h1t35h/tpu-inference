@@ -15,7 +15,6 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.shard_map import shard_map
 from jax.sharding import PartitionSpec as P
 
-
 def inner_mlp_kernel(
     x_tile,
     wg_tile,
@@ -37,7 +36,7 @@ def inner_mlp_kernel(
         h_sram = jnp.matmul(x_tile[...], wg_sram, preferred_element_type=jnp.float32)
         u_sram = jnp.matmul(x_tile[...], wu_sram, preferred_element_type=jnp.float32)
 
-        # Apply Gated activation
+        # Activate
         a_tile = jax.nn.gelu(h_sram, approximate=True) * u_sram
         a_tile = a_tile.astype(x_tile.dtype)
 
@@ -136,9 +135,9 @@ def apply_fused_mlp_sharded(
 ) -> jax.Array:
     in_specs = (
         P(None, None),  # x
-        P(None, "model"),  # wg (gate weight, sharded along model axis)
-        P(None, "model"),  # wu (up weight, sharded along model axis)
-        P("model", None),  # wd (down weight, sharded along model axis)
+        P(None, "model"),  # wg (gate weight, sharded along model/tensor axis)
+        P(None, "model"),  # wu (up weight, sharded along model/tensor axis)
+        P("model", None),  # wd (down weight, sharded along model/tensor axis)
     )
     out_specs = P(None, None)
 
@@ -147,6 +146,7 @@ def apply_fused_mlp_sharded(
         mesh=mesh,
         in_specs=in_specs,
         out_specs=out_specs,
+        check_vma=False,
     )
     def local_fused_mlp(x_loc, wg_loc, wu_loc, wd_loc):
         seq_len, hidden_size = x_loc.shape
