@@ -47,6 +47,7 @@ from tpu_inference.models.jax.jax_intermediate_tensor import \
 from tpu_inference.models.jax.utils.weight_utils import (
     LoadableWithIterator, StandardWeightLoader,
     load_nnx_param_from_reshaped_torch)
+from tpu_inference.kernels.fused_mlp.v1.fused_mlp import apply_fused_mlp_with_padding
 
 logger = init_logger(__name__)
 
@@ -56,13 +57,17 @@ init_fn = nnx.initializers.uniform()
 # MLP arch is the same as Gemma3
 class Gemma4MLP(JaxModule):
 
-    def __init__(self,
-                 config: Gemma4TextConfig,
-                 dtype: jnp.dtype,
-                 rng: nnx.Rngs,
-                 quant_config: VllmQuantConfig,
-                 intermediate_size: int,
-                 prefix: str = ""):
+    def __init__(
+        self,
+        config: Gemma4TextConfig,
+        dtype: jnp.dtype,
+        rng: nnx.Rngs,
+        quant_config: VllmQuantConfig,
+        intermediate_size: int,
+        prefix: str = "",
+        mesh: jax.sharding.Mesh | None = None,
+        use_fused_kernel=False,
+    ):
         hidden_size = config.hidden_size
         # `intermediate_size` is the per-layer MLP width. KV-shared layers
         # use 2x config.intermediate_size when text_config.use_double_wide_mlp
@@ -92,8 +97,19 @@ class Gemma4MLP(JaxModule):
             prefix=prefix + ".down_proj",
         )
         self.act_fn = partial(nnx.gelu, approximate=True)
+        self.use_fused_kernel = use_fused_kernel
+        if use_fused_kernel:
+            assert mesh is not None
+        self.mesh = mesh
 
     def __call__(self, x: jax.Array) -> jax.Array:
+        if self.use_fused_kernel:
+            wg, wu = jnp.split(self.gate_up_proj.weight.get_value, 2, axis=-1)
+            wd = self.down_proj.weight.get_value()
+            return apply_fused_mlp_with_padding(
+                x, wg, wu, wd, self.mesh, b_seq=512, b_inter=256
+            )
+
         gate_up = self.gate_up_proj(x)
         gate, up = jnp.split(gate_up, 2, axis=-1)
         gate = self.act_fn(gate)
@@ -597,6 +613,8 @@ class Gemma4DecoderLayer(JaxModule):
             quant_config=quant_config,
             intermediate_size=layer_intermediate_size,
             prefix=prefix + ".mlp",
+            use_fused_kernel=True,
+            mesh=mesh,
         )
         self.post_feedforward_layernorm = JaxRmsNorm(
             hidden_size,
