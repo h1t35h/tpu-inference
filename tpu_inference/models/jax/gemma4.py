@@ -113,8 +113,19 @@ class Gemma4MLP(JaxModule):
                 n_shards
             )
             wd = self.down_proj.weight.get_value()
+            seq_len = x.shape[0]
+            if seq_len <= 16:
+                b_seq = 16
+            elif seq_len <= 32:
+                b_seq = 32
+            elif seq_len <= 64:
+                b_seq = 64
+            elif seq_len <= 128:
+                b_seq = 128
+            else:
+                b_seq = 256
             return apply_fused_mlp_with_padding(
-                x, wg, wu, wd, self.mesh, b_seq=256, b_inter=128
+                x, wg, wu, wd, self.mesh, b_seq=b_seq, b_inter=256
             )
 
         gate_up = self.gate_up_proj(x)

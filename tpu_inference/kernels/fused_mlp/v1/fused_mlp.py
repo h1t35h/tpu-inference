@@ -92,21 +92,21 @@ def mlp_kernel_main(
     x_spec = pl.BlockSpec((b_seq, hidden_size), lambda i_i: (seq_idx, 0))
     y_spec = pl.BlockSpec((b_seq, hidden_size), lambda i_i: (seq_idx, 0))
 
-    # 2. Triple buffering for weights to hide HBM latency
+    # 2. Double buffering for weights to hide HBM latency (buffer_count=2 allows larger b_inter)
     wg_spec = pl.BlockSpec(
         (hidden_size, b_inter),
         lambda i_i: (0, i_i),
-        pipeline_mode=pl.Buffered(buffer_count=3),
+        pipeline_mode=pl.Buffered(buffer_count=2),
     )
     wu_spec = pl.BlockSpec(
         (hidden_size, b_inter),
         lambda i_i: (0, i_i),
-        pipeline_mode=pl.Buffered(buffer_count=3),
+        pipeline_mode=pl.Buffered(buffer_count=2),
     )
     wd_spec = pl.BlockSpec(
         (b_inter, hidden_size),
         lambda i_i: (i_i, 0),
-        pipeline_mode=pl.Buffered(buffer_count=3),
+        pipeline_mode=pl.Buffered(buffer_count=2),
     )
 
     # 3. Emit the pipeline over the intermediate dimension
