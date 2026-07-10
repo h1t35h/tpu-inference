@@ -228,14 +228,6 @@ def reduce_scatter_kernel(
         with jax.named_scope("initial_left_copy_wait"):
             initial_left_copy.wait()
 
-        # We need a second barrier to ensure everyone has finished prologue_right_mlp?
-        # Actually, double_barrier is not strictly needed here for the right copy, 
-        # but let's keep the synchronization semantic same as original which had a double barrier.
-        # Wait, the original had ONE double_barrier after both left and right MLP.
-        # If we put a barrier after prologue_right_mlp, it acts as the second half of the double barrier.
-        # But `initial_right_copy` just pushes to the right neighbor. The right neighbor is already 
-        # guaranteed to be in the kernel by the first local_barrier!
-        # So we can just start `initial_right_copy` immediately.
         with jax.named_scope("initial_right_copy_start"):
             initial_right_copy.start()
 
