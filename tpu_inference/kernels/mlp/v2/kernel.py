@@ -152,22 +152,23 @@ def reduce_scatter_kernel(
     def inner_compute_a(wg_tile, wu_tile, x_tile, a_tile):
         wg_block = wg_tile[...].astype(x_tile.dtype)
         wu_block = wu_tile[...].astype(x_tile.dtype)
-        wgu_block = jnp.concatenate([wg_block, wu_block], axis=1)
+        
+        # Replace expensive VMEM concatenate with two separate matmuls
+        # MXU processes blocks anyway, so this takes the same MXU time but saves VMEM and VPU copy cycles.
+        g_sram = jnp.matmul(x_tile[...], wg_block, preferred_element_type=x_tile.dtype)
+        u_sram = jnp.matmul(x_tile[...], wu_block, preferred_element_type=x_tile.dtype)
 
-        gu_sram = jnp.matmul(x_tile[...], wgu_block, preferred_element_type=jnp.float32)
-
-        h_sram, u_sram = jnp.split(gu_sram, 2, axis=-1)
-        a_sram_out = jax.nn.gelu(h_sram, approximate=True) * u_sram
+        a_sram_out = jax.nn.gelu(g_sram, approximate=True) * u_sram
         a_tile[...] = a_sram_out.astype(a_tile.dtype)
 
     def inner_compute_y_write(wd_tile, a_tile, y_tile):
         wd_block = wd_tile[...].astype(a_tile.dtype)
-        y_sram = jnp.matmul(a_tile[...], wd_block, preferred_element_type=jnp.float32)
+        y_sram = jnp.matmul(a_tile[...], wd_block, preferred_element_type=a_tile.dtype)
         y_tile[...] = y_sram.astype(y_tile.dtype)
 
     def inner_compute_y_accum(wd_tile, a_tile, y_tile_in, y_tile_out):
         wd_block = wd_tile[...].astype(a_tile.dtype)
-        y_sram = jnp.matmul(a_tile[...], wd_block, preferred_element_type=jnp.float32)
+        y_sram = jnp.matmul(a_tile[...], wd_block, preferred_element_type=a_tile.dtype)
         y_tile_out[...] = y_tile_in[...] + y_sram.astype(y_tile_out.dtype)
 
     def run_mlp_for_slice(device_idx, slice_ds, dest_ref, accumulate):
@@ -175,10 +176,11 @@ def reduce_scatter_kernel(
         start_block = start_row // b_seq
         out_block_start = slice_ds.start // b_seq
 
-        wg_spec = pl.BlockSpec((hidden_size, b_inter), lambda f, s: (0, f))
-        wu_spec = pl.BlockSpec((hidden_size, b_inter), lambda f, s: (0, f))
-        x_spec = pl.BlockSpec((b_seq, hidden_size), lambda f, s: (start_block + s, 0))
-        a_spec = pl.BlockSpec((b_seq, b_inter), lambda f, s: (s, f))
+        buffered_mode = pl.Buffered(buffer_count=2, use_lookahead=True)
+        wg_spec = pl.BlockSpec((hidden_size, b_inter), lambda f, s: (0, f), pipeline_mode=buffered_mode)
+        wu_spec = pl.BlockSpec((hidden_size, b_inter), lambda f, s: (0, f), pipeline_mode=buffered_mode)
+        x_spec = pl.BlockSpec((b_seq, hidden_size), lambda f, s: (start_block + s, 0), pipeline_mode=buffered_mode)
+        a_spec = pl.BlockSpec((b_seq, b_inter), lambda f, s: (s, f), pipeline_mode=buffered_mode)
 
         with jax.named_scope("pipeline_a"):
             pipeline_a = pltpu.emit_pipeline(
@@ -189,9 +191,9 @@ def reduce_scatter_kernel(
             )
             pipeline_a(wg, wu, x, a_scratch_hbm)
 
-        wd_spec = pl.BlockSpec((F_loc, b_hidden), lambda h, s: (0, h))
-        a_spec_in = pl.BlockSpec((b_seq, F_loc), lambda h, s: (s, 0))
-        y_spec = pl.BlockSpec((b_seq, b_hidden), lambda h, s: (out_block_start + s, h))
+        wd_spec = pl.BlockSpec((F_loc, b_hidden), lambda h, s: (0, h), pipeline_mode=buffered_mode)
+        a_spec_in = pl.BlockSpec((b_seq, F_loc), lambda h, s: (s, 0), pipeline_mode=buffered_mode)
+        y_spec = pl.BlockSpec((b_seq, b_hidden), lambda h, s: (out_block_start + s, h), pipeline_mode=buffered_mode)
 
         with jax.named_scope("pipeline_y"):
             if accumulate:
