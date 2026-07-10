@@ -69,7 +69,8 @@ def reduce_scatter_kernel(
     wd,
     o_ref,
     hbm_scratch,
-    x_ref,
+    send_scratch,
+    a_scratch_hbm,
     left_recv_sem,
     left_send_sem,
     copy_sem,
@@ -77,8 +78,6 @@ def reduce_scatter_kernel(
     right_send_sem,
     left_capacity_sem,
     right_capacity_sem,
-    x_scratch,
-    a_scratch,
     *,
     num_devices,
     b_seq,
@@ -108,7 +107,7 @@ def reduce_scatter_kernel(
     current_phase_slice = pl.ds(phase * half_chunk, half_chunk)
 
     initial_left_copy = pltpu.make_async_remote_copy(
-        src_ref=x_ref.at[my_id, left_copy_slice],
+        src_ref=send_scratch.at[left_copy_slice],
         dst_ref=hbm_scratch.at[working_slot, left_copy_slice],
         send_sem=left_send_sem,
         recv_sem=left_recv_sem,
@@ -119,7 +118,7 @@ def reduce_scatter_kernel(
     )
 
     initial_right_copy = pltpu.make_async_remote_copy(
-        src_ref=x_ref.at[my_id, right_copy_slice],
+        src_ref=send_scratch.at[right_copy_slice],
         dst_ref=hbm_scratch.at[working_slot, right_copy_slice],
         send_sem=right_send_sem,
         recv_sem=right_recv_sem,
@@ -150,82 +149,95 @@ def reduce_scatter_kernel(
         device_id_type=pl.DeviceIdType.MESH,
     )
 
-    def inner_compute_a(x_scratch, wg_tile, wu_tile, a_tile):
-        x_val = x_scratch[...]
-        wg_block = wg_tile[...].astype(x_val.dtype)
-        wu_block = wu_tile[...].astype(x_val.dtype)
+    def inner_compute_a(wg_tile, wu_tile, x_tile, a_tile):
+        wg_block = wg_tile[...].astype(x_tile.dtype)
+        wu_block = wu_tile[...].astype(x_tile.dtype)
         wgu_block = jnp.concatenate([wg_block, wu_block], axis=1)
 
-        gu_sram = jnp.matmul(x_val, wgu_block, preferred_element_type=jnp.float32)
+        gu_sram = jnp.matmul(x_tile[...], wgu_block, preferred_element_type=jnp.float32)
 
         h_sram, u_sram = jnp.split(gu_sram, 2, axis=-1)
         a_sram_out = jax.nn.gelu(h_sram, approximate=True) * u_sram
         a_tile[...] = a_sram_out.astype(a_tile.dtype)
 
-    def inner_compute_y(a_scratch, wd_tile, y_tile):
-        a_val = a_scratch[...]
-        wd_block = wd_tile[...].astype(a_val.dtype)
-        y_sram = jnp.matmul(a_val, wd_block, preferred_element_type=jnp.float32)
+    def inner_compute_y_write(wd_tile, a_tile, y_tile):
+        wd_block = wd_tile[...].astype(a_tile.dtype)
+        y_sram = jnp.matmul(a_tile[...], wd_block, preferred_element_type=jnp.float32)
         y_tile[...] = y_sram.astype(y_tile.dtype)
 
-    def run_mlp_for_slice(device_idx, slice_ds):
+    def inner_compute_y_accum(wd_tile, a_tile, y_tile_in, y_tile_out):
+        wd_block = wd_tile[...].astype(a_tile.dtype)
+        y_sram = jnp.matmul(a_tile[...], wd_block, preferred_element_type=jnp.float32)
+        y_tile_out[...] = y_tile_in[...] + y_sram.astype(y_tile_out.dtype)
+
+    def run_mlp_for_slice(device_idx, slice_ds, dest_ref, accumulate):
         start_row = device_idx * chunk_size + slice_ds.start
-        
-        def loop_body(seq_idx, _):
-            x_row = start_row + seq_idx * b_seq
-            out_row = slice_ds.start + seq_idx * b_seq
-            
-            x_block = x_row // b_seq
-            out_block = out_row // b_seq
-            
-            def load_x(x_tile, x_scratch_tile):
-                x_scratch_tile[...] = x_tile[...]
-            
-            pl_load_x = pltpu.emit_pipeline(
-                load_x,
-                grid=(1,),
-                in_specs=(pl.BlockSpec((b_seq, hidden_size), lambda j: (x_block, 0)),),
-                out_specs=(pl.BlockSpec((b_seq, hidden_size), lambda j: (0, 0), memory_space=pltpu.VMEM),)
-            )
-            pl_load_x(x, x_scratch)
-            
-            wg_spec = pl.BlockSpec((hidden_size, b_inter), lambda i: (0, i), pipeline_mode=pl.Buffered(buffer_count=2))
-            wu_spec = pl.BlockSpec((hidden_size, b_inter), lambda i: (0, i), pipeline_mode=pl.Buffered(buffer_count=2))
-            a_spec = pl.BlockSpec((b_seq, b_inter), lambda i: (0, i), memory_space=pltpu.VMEM)
-            
+        start_block = start_row // b_seq
+        out_block_start = slice_ds.start // b_seq
+
+        wg_spec = pl.BlockSpec((hidden_size, b_inter), lambda f, s: (0, f))
+        wu_spec = pl.BlockSpec((hidden_size, b_inter), lambda f, s: (0, f))
+        x_spec = pl.BlockSpec((b_seq, hidden_size), lambda f, s: (start_block + s, 0))
+        a_spec = pl.BlockSpec((b_seq, b_inter), lambda f, s: (s, f))
+
+        with jax.named_scope("pipeline_a"):
             pipeline_a = pltpu.emit_pipeline(
-                functools.partial(inner_compute_a, x_scratch),
-                grid=(F_loc // b_inter,),
-                in_specs=(wg_spec, wu_spec),
+                inner_compute_a,
+                grid=(F_loc // b_inter, half_chunk // b_seq),
+                in_specs=(wg_spec, wu_spec, x_spec),
                 out_specs=a_spec,
             )
-            pipeline_a(wg, wu, a_scratch)
-            
-            wd_spec = pl.BlockSpec((F_loc, b_hidden), lambda j: (0, j), pipeline_mode=pl.Buffered(buffer_count=2))
-            y_spec = pl.BlockSpec((b_seq, b_hidden), lambda j: (out_block, j))
-            
-            pipeline_y = pltpu.emit_pipeline(
-                functools.partial(inner_compute_y, a_scratch),
-                grid=(hidden_size // b_hidden,),
-                in_specs=(wd_spec,),
-                out_specs=y_spec,
-            )
-            pipeline_y(wd, x_ref.at[device_idx, ...])
-            return None
-        
-        jax.lax.fori_loop(0, half_chunk // b_seq, loop_body, None)
+            pipeline_a(wg, wu, x, a_scratch_hbm)
+
+        wd_spec = pl.BlockSpec((F_loc, b_hidden), lambda h, s: (0, h))
+        a_spec_in = pl.BlockSpec((b_seq, F_loc), lambda h, s: (s, 0))
+        y_spec = pl.BlockSpec((b_seq, b_hidden), lambda h, s: (out_block_start + s, h))
+
+        with jax.named_scope("pipeline_y"):
+            if accumulate:
+                pipeline_y = pltpu.emit_pipeline(
+                    inner_compute_y_accum,
+                    grid=(hidden_size // b_hidden, half_chunk // b_seq),
+                    in_specs=(wd_spec, a_spec_in, y_spec),
+                    out_specs=y_spec,
+                )
+                pipeline_y(wd, a_scratch_hbm, dest_ref, dest_ref)
+            else:
+                pipeline_y = pltpu.emit_pipeline(
+                    inner_compute_y_write,
+                    grid=(hidden_size // b_hidden, half_chunk // b_seq),
+                    in_specs=(wd_spec, a_spec_in),
+                    out_specs=y_spec,
+                )
+                pipeline_y(wd, a_scratch_hbm, dest_ref)
 
     # --- Prologue ---
     @pl.when(is_start)
     def _():
-        run_mlp_for_slice(my_id, left_copy_slice)
-        run_mlp_for_slice(my_id, right_copy_slice)
+        with jax.named_scope("prologue_left_mlp"):
+            run_mlp_for_slice(my_id, left_copy_slice, send_scratch, False)
 
-        local_barrier(left_neighbor, right_neighbor, axis_names)
+        local_barrier(left_neighbor, right_neighbor, axis_names, double_barrier=False)
 
-        initial_left_copy.start()
-        initial_left_copy.wait()
-        initial_right_copy.start()
+        with jax.named_scope("initial_left_copy_start"):
+            initial_left_copy.start()
+
+        with jax.named_scope("prologue_right_mlp"):
+            run_mlp_for_slice(my_id, right_copy_slice, send_scratch, False)
+
+        with jax.named_scope("initial_left_copy_wait"):
+            initial_left_copy.wait()
+
+        # We need a second barrier to ensure everyone has finished prologue_right_mlp?
+        # Actually, double_barrier is not strictly needed here for the right copy, 
+        # but let's keep the synchronization semantic same as original which had a double barrier.
+        # Wait, the original had ONE double_barrier after both left and right MLP.
+        # If we put a barrier after prologue_right_mlp, it acts as the second half of the double barrier.
+        # But `initial_right_copy` just pushes to the right neighbor. The right neighbor is already 
+        # guaranteed to be in the kernel by the first local_barrier!
+        # So we can just start `initial_right_copy` immediately.
+        with jax.named_scope("initial_right_copy_start"):
+            initial_right_copy.start()
 
         signal(LEFT, right_capacity_sem, num_devices, axis_names)
         signal(RIGHT, left_capacity_sem, num_devices, axis_names)
@@ -235,71 +247,56 @@ def reduce_scatter_kernel(
         @pl.when(phase == LEFT)
         def _():
             pl.semaphore_wait(right_capacity_sem, 1)
-            right_copy.start()
+            with jax.named_scope("right_copy_start"):
+                right_copy.start()
 
         @pl.when(phase == RIGHT)
         def _():
             pl.semaphore_wait(left_capacity_sem, 1)
-            left_copy.start()
+            with jax.named_scope("left_copy_start"):
+                left_copy.start()
 
     # --- Body ---
-    def inner_kernel(input_ref, accum_ref):
-        @pl.when(pl.program_id(1) == 0)
-        def _():
-            accum_ref[...] = jnp.zeros_like(accum_ref)
-
-        accum_ref[...] += input_ref[...]
-
-    inner_grid = (
-        half_chunk // b_seq,
-        hidden_size // b_hidden,
-    )
-    inner_block_spec = pl.BlockSpec(
-        index_map=lambda i, j: (i, j),
-        block_shape=(b_seq, b_hidden),
-        memory_space=pltpu.VMEM,
-    )
-
-    accum_pipeline = pltpu.emit_pipeline(
-        inner_kernel,
-        in_specs=[inner_block_spec],
-        out_specs=inner_block_spec,
-        grid=inner_grid,
-    )
-
     @pl.when(~last_iteration)
     def _():
         @pl.when(phase == LEFT)
         def _():
-            run_mlp_for_slice(left_copy_device, left_copy_slice)
-            accum_pipeline(
-                x_ref.at[left_copy_device, left_copy_slice],
-                hbm_scratch.at[working_slot, left_copy_slice],
-            )
+            with jax.named_scope("body_left_mlp"):
+                run_mlp_for_slice(
+                    left_copy_device,
+                    left_copy_slice,
+                    hbm_scratch.at[working_slot, ...],
+                    True,
+                )
 
         @pl.when(phase == RIGHT)
         def _():
-            run_mlp_for_slice(right_copy_device, right_copy_slice)
-            accum_pipeline(
-                x_ref.at[right_copy_device, right_copy_slice],
-                hbm_scratch.at[working_slot, right_copy_slice],
-            )
+            with jax.named_scope("body_right_mlp"):
+                run_mlp_for_slice(
+                    right_copy_device,
+                    right_copy_slice,
+                    hbm_scratch.at[working_slot, ...],
+                    True,
+                )
 
     # --- Epilogue ---
     @pl.when(is_start)
     def _():
-        initial_right_copy.wait()
+        with jax.named_scope("initial_right_copy_wait"):
+            initial_right_copy.wait()
 
     @pl.when(~is_start)
     def _():
         @pl.when(phase == LEFT)
         def _():
-            right_copy.wait()
+            with jax.named_scope("right_copy_wait"):
+                right_copy.wait()
             signal(LEFT, right_capacity_sem, num_devices, axis_names)
 
         @pl.when(phase == RIGHT)
         def _():
-            left_copy.wait()
+            with jax.named_scope("left_copy_wait"):
+                left_copy.wait()
             signal(RIGHT, left_capacity_sem, num_devices, axis_names)
 
     # Store result on last iteration.
@@ -310,8 +307,10 @@ def reduce_scatter_kernel(
             dst_ref=o_ref.at[current_phase_slice],
             sem=copy_sem,
         )
-        output_copy.start()
-        output_copy.wait()
+        with jax.named_scope("output_copy_start"):
+            output_copy.start()
+        with jax.named_scope("output_copy_wait"):
+            output_copy.wait()
 
         @pl.when(phase == LEFT)
         def _():
@@ -330,8 +329,8 @@ def apply_fused_mlp_sharded(
     wd: jax.Array,
     mesh: jax.sharding.Mesh,
     b_seq: int = 256,
-    b_inter: int = 128,
-    b_hidden: int = 256,
+    b_inter: int = 512,
+    b_hidden: int = 384,
 ) -> jax.Array:
     in_specs = (
         P(None, None),  # x
@@ -362,8 +361,9 @@ def apply_fused_mlp_sharded(
                 (2, chunk_size, hidden_size), x_loc.dtype
             ),  # hbm_scratch
             jax.ShapeDtypeStruct(
-                (num_devices, chunk_size, hidden_size), x_loc.dtype
-            ),  # x_ref (staging)
+                (chunk_size, hidden_size), x_loc.dtype
+            ),  # send_scratch (was x_ref)
+            jax.ShapeDtypeStruct((half_chunk, F_loc), x_loc.dtype),  # a_scratch_hbm
         )
 
         grid_spec = pltpu.PrefetchScalarGridSpec(
@@ -377,16 +377,13 @@ def apply_fused_mlp_sharded(
             out_specs=[
                 pl.BlockSpec(memory_space=pltpu.HBM),  # o_ref
                 pl.BlockSpec(memory_space=pltpu.HBM),  # hbm_scratch
-                pl.BlockSpec(memory_space=pltpu.HBM),  # x_ref
+                pl.BlockSpec(memory_space=pltpu.HBM),  # send_scratch
+                pl.BlockSpec(memory_space=pltpu.HBM),  # a_scratch_hbm
             ],
             grid=(num_devices, 2),
             scratch_shapes=(
                 [pltpu.SemaphoreType.DMA] * 5
                 + [pltpu.SemaphoreType.REGULAR] * 2  # Capacity semaphores
-                + [
-                    pltpu.VMEM((b_seq, hidden_size), x_loc.dtype),
-                    pltpu.VMEM((b_seq, F_loc), x_loc.dtype),
-                ]
             ),
         )
 
@@ -421,8 +418,8 @@ def apply_fused_mlp_with_padding(
     wd: jax.Array,
     mesh: jax.sharding.Mesh,
     b_seq: int = 256,
-    b_inter: int = 128,
-    b_hidden: int = 256,
+    b_inter: int = 512,
+    b_hidden: int = 384,
 ) -> jax.Array:
     seq_len, hidden_size = x.shape
     num_devices = mesh.devices.size
