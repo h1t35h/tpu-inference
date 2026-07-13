@@ -70,7 +70,6 @@ def reduce_scatter_kernel(
     o_ref,
     hbm_scratch,
     send_scratch,
-    a_scratch_hbm,
     left_recv_sem,
     left_send_sem,
     copy_sem,
@@ -78,6 +77,8 @@ def reduce_scatter_kernel(
     right_send_sem,
     left_capacity_sem,
     right_capacity_sem,
+    x_scratch,
+    y_scratch,
     *,
     num_devices,
     b_seq,
@@ -149,69 +150,120 @@ def reduce_scatter_kernel(
         device_id_type=pl.DeviceIdType.MESH,
     )
 
-    def inner_compute_a(wg_tile, wu_tile, x_tile, a_tile):
-        wg_block = wg_tile[...].astype(x_tile.dtype)
-        wu_block = wu_tile[...].astype(x_tile.dtype)
-        
-        # Replace expensive VMEM concatenate with two separate matmuls
-        # MXU processes blocks anyway, so this takes the same MXU time but saves VMEM and VPU copy cycles.
-        g_sram = jnp.matmul(x_tile[...], wg_block, preferred_element_type=x_tile.dtype)
-        u_sram = jnp.matmul(x_tile[...], wu_block, preferred_element_type=x_tile.dtype)
+    def compute_fused_step(x_scratch, y_scratch, wg_tile, wu_tile, wd_tile):
+        x_val = x_scratch[...]
+        wg_block = wg_tile[...].astype(x_val.dtype)
+        wu_block = wu_tile[...].astype(x_val.dtype)
 
-        a_sram_out = jax.nn.gelu(g_sram, approximate=True) * u_sram
-        a_tile[...] = a_sram_out.astype(a_tile.dtype)
+        g_sram = jnp.matmul(x_val, wg_block, preferred_element_type=jnp.float32)
+        u_sram = jnp.matmul(x_val, wu_block, preferred_element_type=jnp.float32)
+        a_sram = (jax.nn.gelu(g_sram, approximate=True) * u_sram).astype(x_val.dtype)
 
-    def inner_compute_y_write(wd_tile, a_tile, y_tile):
-        wd_block = wd_tile[...].astype(a_tile.dtype)
-        y_sram = jnp.matmul(a_tile[...], wd_block, preferred_element_type=a_tile.dtype)
-        y_tile[...] = y_sram.astype(y_tile.dtype)
+        wd_block = wd_tile[...].astype(a_sram.dtype)
+        y_sram = jnp.matmul(a_sram, wd_block, preferred_element_type=jnp.float32)
 
-    def inner_compute_y_accum(wd_tile, a_tile, y_tile_in, y_tile_out):
-        wd_block = wd_tile[...].astype(a_tile.dtype)
-        y_sram = jnp.matmul(a_tile[...], wd_block, preferred_element_type=a_tile.dtype)
-        y_tile_out[...] = y_tile_in[...] + y_sram.astype(y_tile_out.dtype)
+        y_scratch[...] += y_sram
 
     def run_mlp_for_slice(device_idx, slice_ds, dest_ref, accumulate):
         start_row = device_idx * chunk_size + slice_ds.start
-        start_block = start_row // b_seq
-        out_block_start = slice_ds.start // b_seq
 
-        buffered_mode = pl.Buffered(buffer_count=2, use_lookahead=True)
-        wg_spec = pl.BlockSpec((hidden_size, b_inter), lambda f, s: (0, f), pipeline_mode=buffered_mode)
-        wu_spec = pl.BlockSpec((hidden_size, b_inter), lambda f, s: (0, f), pipeline_mode=buffered_mode)
-        x_spec = pl.BlockSpec((b_seq, hidden_size), lambda f, s: (start_block + s, 0), pipeline_mode=buffered_mode)
-        a_spec = pl.BlockSpec((b_seq, b_inter), lambda f, s: (s, f), pipeline_mode=buffered_mode)
+        def loop_body(seq_idx, _):
+            x_row = start_row + seq_idx * b_seq
+            out_row = slice_ds.start + seq_idx * b_seq
 
-        with jax.named_scope("pipeline_a"):
-            pipeline_a = pltpu.emit_pipeline(
-                inner_compute_a,
-                grid=(F_loc // b_inter, half_chunk // b_seq),
-                in_specs=(wg_spec, wu_spec, x_spec),
-                out_specs=a_spec,
+            x_block = x_row // b_seq
+            out_block = out_row // b_seq
+
+            def load_x(x_tile, x_scratch_tile):
+                x_scratch_tile[...] = x_tile[...]
+
+            pl_load_x = pltpu.emit_pipeline(
+                load_x,
+                grid=(1,),
+                in_specs=(pl.BlockSpec((b_seq, hidden_size), lambda j: (x_block, 0)),),
+                out_specs=(
+                    pl.BlockSpec(
+                        (b_seq, hidden_size), lambda j: (0, 0), memory_space=pltpu.VMEM
+                    ),
+                ),
             )
-            pipeline_a(wg, wu, x, a_scratch_hbm)
+            pl_load_x(x, x_scratch)
 
-        wd_spec = pl.BlockSpec((F_loc, b_hidden), lambda h, s: (0, h), pipeline_mode=buffered_mode)
-        a_spec_in = pl.BlockSpec((b_seq, F_loc), lambda h, s: (s, 0), pipeline_mode=buffered_mode)
-        y_spec = pl.BlockSpec((b_seq, b_hidden), lambda h, s: (out_block_start + s, h), pipeline_mode=buffered_mode)
+            def init_y(y_scratch_tile):
+                y_scratch_tile[...] = jnp.zeros_like(y_scratch_tile)
 
-        with jax.named_scope("pipeline_y"):
+            def load_y(dest_tile, y_scratch_tile):
+                y_scratch_tile[...] = dest_tile[...].astype(y_scratch_tile.dtype)
+
             if accumulate:
-                pipeline_y = pltpu.emit_pipeline(
-                    inner_compute_y_accum,
-                    grid=(hidden_size // b_hidden, half_chunk // b_seq),
-                    in_specs=(wd_spec, a_spec_in, y_spec),
-                    out_specs=y_spec,
+                pl_load_y = pltpu.emit_pipeline(
+                    load_y,
+                    grid=(1,),
+                    in_specs=(
+                        pl.BlockSpec((b_seq, hidden_size), lambda j: (out_block, 0)),
+                    ),
+                    out_specs=(
+                        pl.BlockSpec(
+                            (b_seq, hidden_size),
+                            lambda j: (0, 0),
+                            memory_space=pltpu.VMEM,
+                        ),
+                    ),
                 )
-                pipeline_y(wd, a_scratch_hbm, dest_ref, dest_ref)
+                pl_load_y(dest_ref, y_scratch)
             else:
-                pipeline_y = pltpu.emit_pipeline(
-                    inner_compute_y_write,
-                    grid=(hidden_size // b_hidden, half_chunk // b_seq),
-                    in_specs=(wd_spec, a_spec_in),
-                    out_specs=y_spec,
+                pl_init_y = pltpu.emit_pipeline(
+                    init_y,
+                    grid=(1,),
+                    in_specs=(),
+                    out_specs=(
+                        pl.BlockSpec(
+                            (b_seq, hidden_size),
+                            lambda j: (0, 0),
+                            memory_space=pltpu.VMEM,
+                        ),
+                    ),
                 )
-                pipeline_y(wd, a_scratch_hbm, dest_ref)
+                pl_init_y(y_scratch)
+
+            buffered = pl.Buffered(buffer_count=2, use_lookahead=True)
+            wg_spec = pl.BlockSpec(
+                (hidden_size, b_inter), lambda i: (0, i), pipeline_mode=buffered
+            )
+            wu_spec = pl.BlockSpec(
+                (hidden_size, b_inter), lambda i: (0, i), pipeline_mode=buffered
+            )
+            wd_spec = pl.BlockSpec(
+                (b_inter, hidden_size), lambda i: (i, 0), pipeline_mode=buffered
+            )
+
+            pipeline_fused = pltpu.emit_pipeline(
+                functools.partial(compute_fused_step, x_scratch, y_scratch),
+                grid=(F_loc // b_inter,),
+                in_specs=(wg_spec, wu_spec, wd_spec),
+                out_specs=(),
+            )
+            pipeline_fused(wg, wu, wd)
+
+            def store_y(y_scratch_tile, dest_tile):
+                dest_tile[...] = y_scratch_tile[...].astype(dest_tile.dtype)
+
+            pl_store_y = pltpu.emit_pipeline(
+                store_y,
+                grid=(1,),
+                in_specs=(
+                    pl.BlockSpec(
+                        (b_seq, hidden_size), lambda j: (0, 0), memory_space=pltpu.VMEM
+                    ),
+                ),
+                out_specs=(
+                    pl.BlockSpec((b_seq, hidden_size), lambda j: (out_block, 0)),
+                ),
+            )
+            pl_store_y(y_scratch, dest_ref)
+            return None
+
+        jax.lax.fori_loop(0, half_chunk // b_seq, loop_body, None)
 
     # --- Prologue ---
     @pl.when(is_start)
@@ -322,9 +374,9 @@ def apply_fused_mlp_sharded(
     wu: jax.Array,
     wd: jax.Array,
     mesh: jax.sharding.Mesh,
-    b_seq: int = 256,
-    b_inter: int = 512,
-    b_hidden: int = 384,
+    b_seq: int = 384,
+    b_inter: int = 256,
+    b_hidden: int = 256,
 ) -> jax.Array:
     in_specs = (
         P(None, None),  # x
@@ -357,7 +409,6 @@ def apply_fused_mlp_sharded(
             jax.ShapeDtypeStruct(
                 (chunk_size, hidden_size), x_loc.dtype
             ),  # send_scratch (was x_ref)
-            jax.ShapeDtypeStruct((half_chunk, F_loc), x_loc.dtype),  # a_scratch_hbm
         )
 
         grid_spec = pltpu.PrefetchScalarGridSpec(
@@ -372,12 +423,15 @@ def apply_fused_mlp_sharded(
                 pl.BlockSpec(memory_space=pltpu.HBM),  # o_ref
                 pl.BlockSpec(memory_space=pltpu.HBM),  # hbm_scratch
                 pl.BlockSpec(memory_space=pltpu.HBM),  # send_scratch
-                pl.BlockSpec(memory_space=pltpu.HBM),  # a_scratch_hbm
             ],
             grid=(num_devices, 2),
             scratch_shapes=(
                 [pltpu.SemaphoreType.DMA] * 5
                 + [pltpu.SemaphoreType.REGULAR] * 2  # Capacity semaphores
+                + [
+                    pltpu.VMEM((b_seq, hidden_size), x_loc.dtype),
+                    pltpu.VMEM((b_seq, hidden_size), jnp.float32),
+                ]
             ),
         )
 
@@ -411,9 +465,9 @@ def apply_fused_mlp_with_padding(
     wu: jax.Array,
     wd: jax.Array,
     mesh: jax.sharding.Mesh,
-    b_seq: int = 256,
-    b_inter: int = 512,
-    b_hidden: int = 384,
+    b_seq: int = 384,
+    b_inter: int = 256,
+    b_hidden: int = 256,
 ) -> jax.Array:
     seq_len, hidden_size = x.shape
     num_devices = mesh.devices.size
