@@ -64,8 +64,7 @@ def signal(left_or_right, semaphore, num_devices, axis_names):
 
 def reduce_scatter_kernel(
     x,
-    wg,
-    wu,
+    w_gate_up,
     wd,
     o_ref,
     hbm_scratch,
@@ -231,7 +230,7 @@ def reduce_scatter_kernel(
                 (hidden_size, b_inter), lambda i: (0, i), pipeline_mode=buffered
             )
             wu_spec = pl.BlockSpec(
-                (hidden_size, b_inter), lambda i: (0, i), pipeline_mode=buffered
+                (hidden_size, b_inter), lambda i: (0, i + F_loc // b_inter), pipeline_mode=buffered
             )
             wd_spec = pl.BlockSpec(
                 (b_inter, hidden_size), lambda i: (i, 0), pipeline_mode=buffered
@@ -243,7 +242,7 @@ def reduce_scatter_kernel(
                 in_specs=(wg_spec, wu_spec, wd_spec),
                 out_specs=(),
             )
-            pipeline_fused(wg, wu, wd)
+            pipeline_fused(w_gate_up, w_gate_up, wd)
 
             def store_y(y_scratch_tile, dest_tile):
                 dest_tile[...] = y_scratch_tile[...].astype(dest_tile.dtype)
@@ -367,11 +366,10 @@ def reduce_scatter_kernel(
             pl.semaphore_wait(left_capacity_sem, 1)
 
 
-@functools.partial(jax.jit, static_argnums=(4, 5, 6, 7))
+@functools.partial(jax.jit, static_argnums=(3, 4, 5, 6))
 def apply_fused_mlp_sharded(
     x: jax.Array,
-    wg: jax.Array,
-    wu: jax.Array,
+    w_gate_up: jax.Array,
     wd: jax.Array,
     mesh: jax.sharding.Mesh,
     b_seq: int = 384,
@@ -380,8 +378,7 @@ def apply_fused_mlp_sharded(
 ) -> jax.Array:
     in_specs = (
         P(None, None),  # x
-        P(None, "model"),  # wg
-        P(None, "model"),  # wu
+        P(None, "model"),  # w_gate_up
         P("model", None),  # wd
     )
     out_specs = P(None, None)
@@ -393,9 +390,9 @@ def apply_fused_mlp_sharded(
         out_specs=out_specs,
         check_vma=False,
     )
-    def local_fused_mlp(x_loc, wg_loc, wu_loc, wd_loc):
+    def local_fused_mlp(x_loc, w_gate_up_loc, wd_loc):
         seq_len, hidden_size = x_loc.shape
-        F_loc = wg_loc.shape[1]
+        F_loc = w_gate_up_loc.shape[1] // 2
         num_devices = lax.axis_size("model")
 
         chunk_size = seq_len // num_devices
@@ -415,8 +412,7 @@ def apply_fused_mlp_sharded(
             num_scalar_prefetch=0,
             in_specs=[
                 pl.BlockSpec(memory_space=pltpu.HBM),  # x
-                pl.BlockSpec(memory_space=pltpu.HBM),  # wg
-                pl.BlockSpec(memory_space=pltpu.HBM),  # wu
+                pl.BlockSpec(memory_space=pltpu.HBM),  # w_gate_up
                 pl.BlockSpec(memory_space=pltpu.HBM),  # wd
             ],
             out_specs=[
@@ -451,18 +447,17 @@ def apply_fused_mlp_sharded(
             out_shape=out_shape,
             grid_spec=grid_spec,
             compiler_params=pltpu.CompilerParams(collective_id=0),
-        )(x_loc, wg_loc, wu_loc, wd_loc)[0]
+        )(x_loc, w_gate_up_loc, wd_loc)[0]
 
         # Gather all chunks from all devices to form the complete (seq_len, hidden_size) array
         return jax.lax.all_gather(y_chunk, axis_name="model", tiled=True)
 
-    return local_fused_mlp(x, wg, wu, wd)
+    return local_fused_mlp(x, w_gate_up, wd)
 
 
 def apply_fused_mlp_with_padding(
     x: jax.Array,
-    wg: jax.Array,
-    wu: jax.Array,
+    w_gate_up: jax.Array,
     wd: jax.Array,
     mesh: jax.sharding.Mesh,
     b_seq: int = 384,
@@ -476,11 +471,11 @@ def apply_fused_mlp_with_padding(
     chunk_multiple = num_devices * 2 * b_seq
     rem = seq_len % chunk_multiple
     if rem == 0:
-        return apply_fused_mlp_sharded(x, wg, wu, wd, mesh, b_seq, b_inter, b_hidden)
+        return apply_fused_mlp_sharded(x, w_gate_up, wd, mesh, b_seq, b_inter, b_hidden)
 
     pad_len = chunk_multiple - rem
     x_padded = jnp.pad(x, ((0, pad_len), (0, 0)), mode="constant")
     out_padded = apply_fused_mlp_sharded(
-        x_padded, wg, wu, wd, mesh, b_seq, b_inter, b_hidden
+        x_padded, w_gate_up, wd, mesh, b_seq, b_inter, b_hidden
     )
     return out_padded[:seq_len, :]
